@@ -22,6 +22,8 @@
 #define MSG_PLAYER_DISCONNECT 7
 #define MSG_CHAT              8   /* Server relays a guess attempt with player name */
 #define MSG_GUESSED_NOTIFY    9   /* Tell a player they guessed correctly */
+#define MSG_DRAW_LINE        10   /* Line segment drawing data */
+#define MSG_DRAW_CLEAR       11   /* Clear the canvas */
 
 /*
  * Wire format (network byte order):

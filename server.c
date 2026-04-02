@@ -11,8 +11,10 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <time.h>
+#include <signal.h>
 #include "net.h"
 #include "game.h"
+#include "websocket.h"
 
 #define BACKLOG 5
 #define WORDS_FILE "words.txt"
@@ -25,10 +27,13 @@ typedef struct {
     int fd;
     char name[MAX_NAME_LEN];
     int active;
+    int is_websocket;
+    int ws_handshake_done;
 } client_info_t;
 
 static client_info_t clients[MAX_PLAYERS];
 static int listen_fd = -1;
+static int ws_listen_fd = -1;
 static game_state_t *game = NULL;
 static time_t round_start_time = 0;
 static int last_countdown = -1;  /* Last countdown value broadcast */
@@ -39,6 +44,8 @@ static void init_clients(void)
         clients[i].fd = -1;
         clients[i].name[0] = '\0';
         clients[i].active = 0;
+        clients[i].is_websocket = 0;
+        clients[i].ws_handshake_done = 0;
     }
 }
 
@@ -51,7 +58,52 @@ static int find_empty_slot(void)
     return -1;
 }
 
-static void send_chat(int fd, const char *text)
+/*
+ * Send a message to a client, handling WebSocket framing if needed.
+ */
+static int server_send_msg(int slot, const message_t *msg)
+{
+    if (clients[slot].is_websocket) {
+        /* Serialize TLV into a buffer, then send as WS binary frame */
+        uint8_t buf[8 + MAX_PAYLOAD];
+        uint32_t net_type = htonl(msg->msg_type);
+        uint32_t net_len  = htonl(msg->length);
+        memcpy(buf, &net_type, 4);
+        memcpy(buf + 4, &net_len, 4);
+        if (msg->length > 0)
+            memcpy(buf + 8, msg->payload, msg->length);
+        return ws_send_frame(clients[slot].fd, buf, 8 + msg->length);
+    }
+    return send_message(clients[slot].fd, msg);
+}
+
+/*
+ * Receive a message from a client, handling WebSocket framing if needed.
+ */
+static int server_recv_msg(int slot, message_t *msg)
+{
+    if (clients[slot].is_websocket) {
+        uint8_t buf[8 + MAX_PAYLOAD];
+        uint8_t opcode;
+        int n = ws_recv_frame(clients[slot].fd, buf, sizeof(buf), &opcode);
+        if (n <= 0) return -1;
+        if (opcode == WS_OP_CLOSE) return -1;
+        if (n < 8) return -1;
+
+        uint32_t net_type, net_len;
+        memcpy(&net_type, buf, 4);
+        memcpy(&net_len, buf + 4, 4);
+        msg->msg_type = ntohl(net_type);
+        msg->length   = ntohl(net_len);
+        if (msg->length > MAX_PAYLOAD) return -1;
+        if (msg->length > 0)
+            memcpy(msg->payload, buf + 8, msg->length);
+        return 0;
+    }
+    return recv_message(clients[slot].fd, msg);
+}
+
+static void send_chat_to_slot(int slot, const char *text)
 {
     message_t msg;
     memset(&msg, 0, sizeof(msg));
@@ -60,14 +112,14 @@ static void send_chat(int fd, const char *text)
     if (msg.length > MAX_PAYLOAD)
         msg.length = MAX_PAYLOAD;
     memcpy(msg.payload, text, msg.length);
-    send_message(fd, &msg);
+    server_send_msg(slot, &msg);
 }
 
 static void broadcast_chat(const char *text)
 {
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (clients[i].fd != -1)
-            send_chat(clients[i].fd, text);
+            send_chat_to_slot(i, text);
     }
 }
 
@@ -78,7 +130,7 @@ static void broadcast_to_clients(const message_t *msg, int skip_slot)
 {
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (clients[i].fd != -1 && i != skip_slot) {
-            if (send_message(clients[i].fd, msg) < 0) {
+            if (server_send_msg(i, msg) < 0) {
                 fprintf(stderr, "Failed to send to slot %d, removing\n", i);
                 remove_client(i);
             }
@@ -232,7 +284,7 @@ static void start_round(void)
             msg.length = 1 + tlen;
         }
 
-        send_message(clients[i].fd, &msg);
+        server_send_msg(i, &msg);
     }
 }
 
@@ -258,8 +310,41 @@ static int accept_client(void)
     clients[slot].fd = client_fd;
     clients[slot].active = 0;
     clients[slot].name[0] = '\0';
+    clients[slot].is_websocket = 0;
+    clients[slot].ws_handshake_done = 0;
 
     printf("New connection from %s:%d (slot %d, fd %d)\n",
+           inet_ntoa(addr.sin_addr), ntohs(addr.sin_port),
+           slot, client_fd);
+    return slot;
+}
+
+static int accept_ws_client(void)
+{
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+
+    int client_fd = accept(ws_listen_fd, (struct sockaddr *)&addr, &addrlen);
+    if (client_fd < 0) {
+        perror("accept (ws)");
+        return -1;
+    }
+
+    int slot = find_empty_slot();
+    if (slot < 0) {
+        fprintf(stderr, "Server full, rejecting WS %s:%d\n",
+                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+        close(client_fd);
+        return -1;
+    }
+
+    clients[slot].fd = client_fd;
+    clients[slot].active = 0;
+    clients[slot].name[0] = '\0';
+    clients[slot].is_websocket = 1;
+    clients[slot].ws_handshake_done = 0;
+
+    printf("New WebSocket connection from %s:%d (slot %d, fd %d)\n",
            inet_ntoa(addr.sin_addr), ntohs(addr.sin_port),
            slot, client_fd);
     return slot;
@@ -297,6 +382,8 @@ static void remove_client(int slot)
         clients[slot].active = 0;
         clients[slot].name[0] = '\0';
     }
+    clients[slot].is_websocket = 0;
+    clients[slot].ws_handshake_done = 0;
 }
 
 static void handle_player_join(int slot, const message_t *msg)
@@ -332,10 +419,10 @@ static void handle_player_join(int slot, const message_t *msg)
     broadcast_chat(buf);
 
     if (!game->game_started) {
-        send_chat(clients[slot].fd,
+        send_chat_to_slot(slot,
             "Welcome! Type \"play\" to start the game.\n");
     } else if (game->round_active) {
-        send_chat(clients[slot].fd,
+        send_chat_to_slot(slot,
             "A round is in progress. You'll join the next one.\n");
     }
 }
@@ -353,7 +440,7 @@ static void handle_guess(int slot, const message_t *msg)
     if (!game->round_active && !game->game_started) {
         if (strcasecmp(guess, "play") == 0) {
             if (game->num_players < 2) {
-                send_chat(clients[slot].fd,
+                send_chat_to_slot(slot,
                     "Need at least 2 players to start.\n");
                 return;
             }
@@ -395,19 +482,19 @@ static void handle_guess(int slot, const message_t *msg)
     }
 
     if (!player) {
-        send_chat(clients[slot].fd,
+        send_chat_to_slot(slot,
             "You're not in the current round. Wait for the next one.\n");
         return;
     }
 
     if (player->is_artist) {
-        send_chat(clients[slot].fd,
+        send_chat_to_slot(slot,
             "You're the drawer! You can't guess.\n");
         return;
     }
 
     if (player->has_guessed) {
-        send_chat(clients[slot].fd,
+        send_chat_to_slot(slot,
             "You already guessed correctly! Wait for the round to end.\n");
         return;
     }
@@ -438,7 +525,7 @@ static void handle_guess(int slot, const message_t *msg)
             guesser_pts, player->score);
         notify.length = (uint32_t)strlen(nbuf);
         memcpy(notify.payload, nbuf, notify.length);
-        send_message(clients[slot].fd, &notify);
+        server_send_msg(slot, &notify);
 
         /* Broadcast to everyone */
         char buf[MAX_PAYLOAD];
@@ -460,10 +547,22 @@ static void handle_guess(int slot, const message_t *msg)
 
 static void handle_client_message(int slot)
 {
+    /* WebSocket clients need handshake first */
+    if (clients[slot].is_websocket && !clients[slot].ws_handshake_done) {
+        if (ws_do_handshake(clients[slot].fd) < 0) {
+            fprintf(stderr, "WebSocket handshake failed for slot %d\n", slot);
+            remove_client(slot);
+            return;
+        }
+        clients[slot].ws_handshake_done = 1;
+        printf("WebSocket handshake complete (slot %d)\n", slot);
+        return;
+    }
+
     message_t msg;
     memset(&msg, 0, sizeof(msg));
 
-    if (recv_message(clients[slot].fd, &msg) < 0) {
+    if (server_recv_msg(slot, &msg) < 0) {
         remove_client(slot);
         return;
     }
@@ -478,7 +577,12 @@ static void handle_client_message(int slot)
         break;
 
     case MSG_BRUSH_STROKE:
+    case MSG_DRAW_LINE:
         broadcast_to_clients(&msg, slot);
+        break;
+
+    case MSG_DRAW_CLEAR:
+        broadcast_to_clients(&msg, -1);
         break;
 
     default:
@@ -527,6 +631,12 @@ static int build_fdset(fd_set *readfds)
     FD_ZERO(readfds);
     FD_SET(listen_fd, readfds);
     int maxfd = listen_fd;
+
+    if (ws_listen_fd != -1) {
+        FD_SET(ws_listen_fd, readfds);
+        if (ws_listen_fd > maxfd)
+            maxfd = ws_listen_fd;
+    }
 
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (clients[i].fd != -1) {
@@ -580,6 +690,8 @@ int main(int argc, char *argv[])
     if (argc > 1)
         port = atoi(argv[1]);
 
+    signal(SIGPIPE, SIG_IGN);
+
     init_clients();
 
     game = game_init();
@@ -600,7 +712,17 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    printf("Server listening on port %d\n", port);
+    ws_listen_fd = setup_server(port + 1);
+    if (ws_listen_fd < 0) {
+        fprintf(stderr, "Warning: could not start WebSocket listener on port %d\n",
+                port + 1);
+    }
+
+    printf("Server listening on port %d (TCP) and %d (WebSocket)\n",
+           port, port + 1);
+    printf("Open index.html in your browser and connect to localhost:%d\n",
+           port + 1);
+    printf("(If using WSL2, run 'hostname -I' to find your WSL IP)\n");
 
     while (1) {
         fd_set readfds;
@@ -635,6 +757,10 @@ int main(int argc, char *argv[])
             accept_client();
         }
 
+        if (ws_listen_fd != -1 && FD_ISSET(ws_listen_fd, &readfds)) {
+            accept_ws_client();
+        }
+
         for (int i = 0; i < MAX_PLAYERS; i++) {
             if (clients[i].fd != -1 &&
                 FD_ISSET(clients[i].fd, &readfds)) {
@@ -648,6 +774,8 @@ int main(int argc, char *argv[])
             close(clients[i].fd);
     }
     close(listen_fd);
+    if (ws_listen_fd != -1)
+        close(ws_listen_fd);
     game_cleanup(game);
     return 0;
 }

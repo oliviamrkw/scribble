@@ -4,7 +4,16 @@
       "Bash(make clean:*)",
       "Bash(make)",
       "Bash(gcc -Wall -Wextra -std=c99 -o test_game test_game.c game.c net.c)",
-      "Bash(./test_game)"
+      "Bash(./test_game)",
+      "Bash(timeout 2 ./server)",
+      "Bash(timeout 3 ./server)",
+      "Bash(netstat -tlnp)",
+      "Bash(wait)",
+      "Bash(openssl sha1:*)",
+      "Bash(python3 -c \"import websocket; print\\('websocket-client available'\\)\")",
+      "Bash(pip3 install:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(printf '%s' 'dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-5AB9DC11E85A')"
     ]
   }
 }

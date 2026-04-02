@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Scribble</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+#login-screen {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    gap: 16px;
+}
+#login-screen h1 { font-size: 48px; color: #e94560; }
+#login-screen input {
+    padding: 12px 20px;
+    font-size: 18px;
+    border: 2px solid #e94560;
+    border-radius: 8px;
+    background: #16213e;
+    color: #eee;
+    outline: none;
+    width: 300px;
+}
+#login-screen button {
+    padding: 12px 40px;
+    font-size: 18px;
+    background: #e94560;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+}
+#login-screen button:hover { background: #c73650; }
+
+#game-screen { display: none; height: 100vh; flex-direction: column; }
+#toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    background: #16213e;
+    border-bottom: 2px solid #0f3460;
+}
+#toolbar label { font-size: 14px; color: #aaa; }
+.tool-btn {
+    padding: 6px 16px;
+    border: 2px solid #555;
+    border-radius: 6px;
+    background: #1a1a2e;
+    color: #eee;
+    cursor: pointer;
+    font-size: 14px;
+}
+.tool-btn.active { border-color: #e94560; background: #e94560; color: #fff; }
+#color-picker {
+    width: 36px;
+    height: 36px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    background: none;
+}
+#size-slider { width: 100px; }
+#size-display { font-size: 14px; color: #aaa; min-width: 30px; }
+#clear-btn {
+    margin-left: auto;
+    padding: 6px 16px;
+    border: 2px solid #555;
+    border-radius: 6px;
+    background: #1a1a2e;
+    color: #eee;
+    cursor: pointer;
+    font-size: 14px;
+}
+#clear-btn:hover { border-color: #e94560; }
+
+#main-area {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+}
+#canvas-wrap {
+    flex: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0f3460;
+    padding: 12px;
+}
+#draw-canvas {
+    background: #fff;
+    border-radius: 4px;
+    cursor: crosshair;
+    max-width: 100%;
+    max-height: 100%;
+}
+#chat-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #16213e;
+    border-left: 2px solid #0f3460;
+}
+#chat-header {
+    padding: 10px 16px;
+    font-weight: bold;
+    font-size: 16px;
+    border-bottom: 1px solid #0f3460;
+    color: #e94560;
+}
+#chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 12px;
+    font-size: 14px;
+    line-height: 1.6;
+}
+#chat-messages .system { color: #e94560; font-style: italic; }
+#chat-messages .guess { color: #ccc; }
+#chat-messages .correct { color: #4ecca3; font-weight: bold; }
+#chat-input-wrap {
+    display: flex;
+    border-top: 1px solid #0f3460;
+}
+#chat-input {
+    flex: 1;
+    padding: 10px 12px;
+    border: none;
+    background: #1a1a2e;
+    color: #eee;
+    font-size: 14px;
+    outline: none;
+}
+#chat-send {
+    padding: 10px 16px;
+    background: #e94560;
+    color: #fff;
+    border: none;
+    cursor: pointer;
+    font-size: 14px;
+}
+#status-bar {
+    padding: 6px 16px;
+    background: #0f3460;
+    font-size: 13px;
+    color: #aaa;
+    text-align: center;
+}
+</style>
+</head>
+<body>
+
+<!-- Login Screen -->
+<div id="login-screen">
+    <h1>Scribble</h1>
+    <input type="text" id="name-input" placeholder="Enter your name" maxlength="31" autofocus>
+    <input type="text" id="host-input" placeholder="Server host" value="localhost">
+    <input type="number" id="port-input" placeholder="WS Port" value="4243">
+    <div style="font-size: 12px; color: #888; max-width: 300px; text-align: center;">
+        If using WSL2, try your WSL IP instead of localhost.<br>
+        Run <code style="color:#e94560;">hostname -I</code> in WSL to find it.
+    </div>
+    <button id="join-btn">Join Game</button>
+    <div id="login-error" style="color: #e94560;"></div>
+</div>
+
+<!-- Game Screen -->
+<div id="game-screen">
+    <div id="toolbar">
+        <button class="tool-btn active" id="brush-btn">Brush</button>
+        <button class="tool-btn" id="eraser-btn">Eraser</button>
+        <label>Color:</label>
+        <input type="color" id="color-picker" value="#000000">
+        <label>Size:</label>
+        <input type="range" id="size-slider" min="1" max="30" value="4">
+        <span id="size-display">4</span>
+        <button id="clear-btn">Clear</button>
+    </div>
+    <div id="main-area">
+        <div id="canvas-wrap">
+            <canvas id="draw-canvas" width="800" height="600"></canvas>
+        </div>
+        <div id="chat-panel">
+            <div id="chat-header">Chat</div>
+            <div id="chat-messages"></div>
+            <div id="chat-input-wrap">
+                <input type="text" id="chat-input" placeholder="Type a guess..." maxlength="256">
+                <button id="chat-send">Send</button>
+            </div>
+        </div>
+    </div>
+    <div id="status-bar">Connecting...</div>
+</div>
+
+<script>
+/* ------------------------------------------------------------------ */
+/*  Constants matching net.h                                          */
+/* ------------------------------------------------------------------ */
+const MSG_PLAYER_JOIN    = 1;
+const MSG_ROUND_START    = 2;
+const MSG_BRUSH_STROKE   = 3;
+const MSG_GUESS          = 4;
+const MSG_CORRECT_GUESS  = 5;
+const MSG_ROUND_END      = 6;
+const MSG_PLAYER_DISCONNECT = 7;
+const MSG_CHAT           = 8;
+const MSG_GUESSED_NOTIFY = 9;
+const MSG_DRAW_LINE      = 10;
+const MSG_DRAW_CLEAR     = 11;
+
+const CANVAS_W = 800;
+const CANVAS_H = 600;
+
+/* ------------------------------------------------------------------ */
+/*  State                                                             */
+/* ------------------------------------------------------------------ */
+let ws = null;
+let playerName = '';
+let isArtist = false;
+let hasGuessed = false;
+let currentTool = 0; /* 0=brush, 1=eraser */
+let brushColor = [0, 0, 0];
+let brushSize = 4;
+let drawing = false;
+let lastX = -1, lastY = -1;
+
+const canvas = document.getElementById('draw-canvas');
+const ctx = canvas.getContext('2d');
+
+/* ------------------------------------------------------------------ */
+/*  TLV binary helpers                                                */
+/* ------------------------------------------------------------------ */
+function buildTLV(type, payload) {
+    /* payload is a Uint8Array or null */
+    const plen = payload ? payload.length : 0;
+    const buf = new ArrayBuffer(8 + plen);
+    const dv = new DataView(buf);
+    dv.setUint32(0, type, false); /* network byte order = big endian */
+    dv.setUint32(4, plen, false);
+    if (payload) new Uint8Array(buf, 8).set(payload);
+    return buf;
+}
+
+function parseTLV(data) {
+    const dv = new DataView(data);
+    const type = dv.getUint32(0, false);
+    const length = dv.getUint32(4, false);
+    const payload = new Uint8Array(data, 8, length);
+    return { type, length, payload };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Send helpers                                                      */
+/* ------------------------------------------------------------------ */
+function sendPlayerJoin(name) {
+    const nameBytes = new TextEncoder().encode(name);
+    const payload = new Uint8Array(4 + nameBytes.length);
+    const dv = new DataView(payload.buffer);
+    dv.setUint32(0, nameBytes.length, false);
+    payload.set(nameBytes, 4);
+    ws.send(buildTLV(MSG_PLAYER_JOIN, payload));
+}
+
+function sendGuess(text) {
+    const bytes = new TextEncoder().encode(text);
+    ws.send(buildTLV(MSG_GUESS, bytes));
+}
+
+function sendDrawLine(x1, y1, x2, y2, r, g, b, size, tool) {
+    const payload = new Uint8Array(13);
+    const dv = new DataView(payload.buffer);
+    dv.setUint16(0, x1, false);
+    dv.setUint16(2, y1, false);
+    dv.setUint16(4, x2, false);
+    dv.setUint16(6, y2, false);
+    payload[8] = r;
+    payload[9] = g;
+    payload[10] = b;
+    payload[11] = size;
+    payload[12] = tool;
+    ws.send(buildTLV(MSG_DRAW_LINE, payload));
+}
+
+function sendDrawClear() {
+    ws.send(buildTLV(MSG_DRAW_CLEAR, null));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Drawing                                                           */
+/* ------------------------------------------------------------------ */
+function drawLineOnCanvas(x1, y1, x2, y2, r, g, b, size, tool) {
+    ctx.save();
+    if (tool === 1) {
+        /* Eraser: draw in white */
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.strokeStyle = 'rgba(255,255,255,1)';
+    } else {
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.strokeStyle = `rgb(${r},${g},${b})`;
+    }
+    ctx.lineWidth = size;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+}
+
+function getCanvasPos(e) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = CANVAS_W / rect.width;
+    const scaleY = CANVAS_H / rect.height;
+    return {
+        x: Math.round((e.clientX - rect.left) * scaleX),
+        y: Math.round((e.clientY - rect.top) * scaleY)
+    };
+}
+
+canvas.addEventListener('mousedown', (e) => {
+    drawing = true;
+    const pos = getCanvasPos(e);
+    lastX = pos.x;
+    lastY = pos.y;
+    /* Draw a dot at the starting point */
+    const [r, g, b] = currentTool === 1 ? [255, 255, 255] : brushColor;
+    drawLineOnCanvas(lastX, lastY, lastX, lastY, r, g, b, brushSize, currentTool);
+    if (ws && ws.readyState === WebSocket.OPEN)
+        sendDrawLine(lastX, lastY, lastX, lastY, r, g, b, brushSize, currentTool);
+});
+
+canvas.addEventListener('mousemove', (e) => {
+    if (!drawing) return;
+    const pos = getCanvasPos(e);
+    const [r, g, b] = currentTool === 1 ? [255, 255, 255] : brushColor;
+    drawLineOnCanvas(lastX, lastY, pos.x, pos.y, r, g, b, brushSize, currentTool);
+    if (ws && ws.readyState === WebSocket.OPEN)
+        sendDrawLine(lastX, lastY, pos.x, pos.y, r, g, b, brushSize, currentTool);
+    lastX = pos.x;
+    lastY = pos.y;
+});
+
+canvas.addEventListener('mouseup', () => { drawing = false; });
+canvas.addEventListener('mouseleave', () => { drawing = false; });
+
+/* ------------------------------------------------------------------ */
+/*  Toolbar                                                           */
+/* ------------------------------------------------------------------ */
+document.getElementById('brush-btn').addEventListener('click', () => {
+    currentTool = 0;
+    document.getElementById('brush-btn').classList.add('active');
+    document.getElementById('eraser-btn').classList.remove('active');
+    canvas.style.cursor = 'crosshair';
+});
+
+document.getElementById('eraser-btn').addEventListener('click', () => {
+    currentTool = 1;
+    document.getElementById('eraser-btn').classList.add('active');
+    document.getElementById('brush-btn').classList.remove('active');
+    canvas.style.cursor = 'cell';
+});
+
+document.getElementById('color-picker').addEventListener('input', (e) => {
+    const hex = e.target.value;
+    brushColor = [
+        parseInt(hex.substr(1, 2), 16),
+        parseInt(hex.substr(3, 2), 16),
+        parseInt(hex.substr(5, 2), 16)
+    ];
+});
+
+document.getElementById('size-slider').addEventListener('input', (e) => {
+    brushSize = parseInt(e.target.value);
+    document.getElementById('size-display').textContent = brushSize;
+});
+
+document.getElementById('clear-btn').addEventListener('click', () => {
+    ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    if (ws && ws.readyState === WebSocket.OPEN)
+        sendDrawClear();
+});
+
+/* ------------------------------------------------------------------ */
+/*  Chat                                                              */
+/* ------------------------------------------------------------------ */
+function addChatMessage(text, cls) {
+    const el = document.getElementById('chat-messages');
+    const div = document.createElement('div');
+    div.className = cls || '';
+    div.textContent = text;
+    el.appendChild(div);
+    el.scrollTop = el.scrollHeight;
+}
+
+document.getElementById('chat-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendChatInput();
+});
+document.getElementById('chat-send').addEventListener('click', sendChatInput);
+
+function sendChatInput() {
+    const input = document.getElementById('chat-input');
+    const text = input.value.trim();
+    if (!text) return;
+    sendGuess(text);
+    input.value = '';
+}
+
+/* ------------------------------------------------------------------ */
+/*  Message handler                                                   */
+/* ------------------------------------------------------------------ */
+function handleMessage(data) {
+    const msg = parseTLV(data);
+    const textDecoder = new TextDecoder();
+
+    switch (msg.type) {
+    case MSG_CHAT: {
+        const text = textDecoder.decode(msg.payload);
+        addChatMessage(text, 'guess');
+        break;
+    }
+    case MSG_ROUND_START: {
+        isArtist = msg.payload[0] === 1;
+        hasGuessed = false;
+        const text = textDecoder.decode(msg.payload.slice(1));
+        addChatMessage(text, 'system');
+        /* Clear canvas for new round */
+        ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+        document.getElementById('status-bar').textContent =
+            isArtist ? 'You are drawing!' : 'Guess the word!';
+        break;
+    }
+    case MSG_GUESSED_NOTIFY: {
+        hasGuessed = true;
+        const text = textDecoder.decode(msg.payload);
+        addChatMessage(text, 'correct');
+        document.getElementById('status-bar').textContent = 'You guessed it!';
+        break;
+    }
+    case MSG_DRAW_LINE: {
+        if (msg.length >= 13) {
+            const dv = new DataView(msg.payload.buffer, msg.payload.byteOffset, msg.payload.byteLength);
+            const x1 = dv.getUint16(0, false);
+            const y1 = dv.getUint16(2, false);
+            const x2 = dv.getUint16(4, false);
+            const y2 = dv.getUint16(6, false);
+            const r = msg.payload[8];
+            const g = msg.payload[9];
+            const b = msg.payload[10];
+            const sz = msg.payload[11];
+            const tool = msg.payload[12];
+            drawLineOnCanvas(x1, y1, x2, y2, r, g, b, sz, tool);
+        }
+        break;
+    }
+    case MSG_DRAW_CLEAR: {
+        ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+        break;
+    }
+    case MSG_PLAYER_DISCONNECT: {
+        const text = textDecoder.decode(msg.payload);
+        addChatMessage(text, 'system');
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Connection                                                        */
+/* ------------------------------------------------------------------ */
+function connect(host, port, name) {
+    const url = `ws://${host}:${port}`;
+    ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+        console.log('WebSocket connected to', url);
+        document.getElementById('login-screen').style.display = 'none';
+        document.getElementById('game-screen').style.display = 'flex';
+        document.getElementById('status-bar').textContent = 'Connected. Type "play" in chat to start!';
+        sendPlayerJoin(name);
+    };
+
+    ws.onmessage = (e) => {
+        console.log('WebSocket message received:', e.data);
+        if (e.data instanceof ArrayBuffer) {
+            handleMessage(e.data);
+        }
+    };
+
+    ws.onclose = (e) => {
+        console.log('WebSocket closed:', e.code, e.reason, 'wasClean:', e.wasClean);
+        document.getElementById('status-bar').textContent = 'Disconnected from server.';
+        addChatMessage('Connection lost.', 'system');
+    };
+
+    ws.onerror = (e) => {
+        console.error('WebSocket error:', e);
+        document.getElementById('login-error').textContent =
+            `Could not connect to ${url}. Is the server running?`;
+    };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Login                                                             */
+/* ------------------------------------------------------------------ */
+document.getElementById('join-btn').addEventListener('click', doJoin);
+document.getElementById('name-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') doJoin();
+});
+
+function doJoin() {
+    const name = document.getElementById('name-input').value.trim();
+    if (!name) {
+        document.getElementById('login-error').textContent = 'Please enter a name.';
+        return;
+    }
+    const host = document.getElementById('host-input').value.trim() || 'localhost';
+    const port = document.getElementById('port-input').value.trim() || '4243';
+    playerName = name;
+    connect(host, parseInt(port), name);
+}
+</script>
+</body>
+</html>
