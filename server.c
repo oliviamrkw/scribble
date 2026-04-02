@@ -18,6 +18,7 @@
 
 #define BACKLOG 5
 #define WORDS_FILE "words.txt"
+#define HTML_FILE  "index.html"
 
 #ifndef PORT
 #define PORT DEFAULT_PORT
@@ -549,9 +550,20 @@ static void handle_client_message(int slot)
 {
     /* WebSocket clients need handshake first */
     if (clients[slot].is_websocket && !clients[slot].ws_handshake_done) {
-        if (ws_do_handshake(clients[slot].fd) < 0) {
+        int hs = ws_do_handshake(clients[slot].fd, HTML_FILE);
+        if (hs < 0) {
             fprintf(stderr, "WebSocket handshake failed for slot %d\n", slot);
             remove_client(slot);
+            return;
+        }
+        if (hs == 1) {
+            /* Served HTTP page, close connection (not a WebSocket) */
+            printf("Served index.html to slot %d\n", slot);
+            close(clients[slot].fd);
+            clients[slot].fd = -1;
+            clients[slot].active = 0;
+            clients[slot].is_websocket = 0;
+            clients[slot].ws_handshake_done = 0;
             return;
         }
         clients[slot].ws_handshake_done = 1;

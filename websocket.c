@@ -104,7 +104,56 @@ static void base64_encode(const uint8_t *in, size_t len, char *out)
 #define WS_GUID "258EAFA5-E914-47DA-95CA-5AB9DC11E85A"
 #define HANDSHAKE_BUF 4096
 
-int ws_do_handshake(int fd)
+/*
+ * Serve a file as an HTTP response, then return 1.
+ */
+static int serve_http_file(int fd, const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        const char *r404 = "HTTP/1.1 404 Not Found\r\n"
+                           "Connection: close\r\n\r\n"
+                           "File not found.\n";
+        write(fd, r404, strlen(r404));
+        return 1;
+    }
+
+    /* Read entire file */
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *body = malloc((size_t)fsize + 1);
+    if (!body) { fclose(f); return -1; }
+    fsize = (long)fread(body, 1, (size_t)fsize, f);
+    fclose(f);
+
+    /* Send HTTP response */
+    char header[512];
+    int hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
+        "Content-Length: %ld\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: no-cache\r\n"
+        "\r\n", fsize);
+
+    ssize_t sent = 0;
+    while (sent < hlen) {
+        ssize_t w = write(fd, header + sent, (size_t)(hlen - sent));
+        if (w <= 0) { free(body); return -1; }
+        sent += w;
+    }
+    sent = 0;
+    while (sent < fsize) {
+        ssize_t w = write(fd, body + sent, (size_t)(fsize - sent));
+        if (w <= 0) { free(body); return -1; }
+        sent += w;
+    }
+    free(body);
+    return 1;
+}
+
+int ws_do_handshake(int fd, const char *html_path)
 {
     char buf[HANDSHAKE_BUF];
     size_t total = 0;
@@ -112,17 +161,22 @@ int ws_do_handshake(int fd)
     /* Read until we have the full HTTP request (ends with \r\n\r\n) */
     while (total < sizeof(buf) - 1) {
         ssize_t n = recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
-        if (n <= 0) {
-            fprintf(stderr, "ws_handshake: recv failed (%zd)\n", n);
-            return -1;
-        }
+        if (n <= 0) return -1;
         total += (size_t)n;
         buf[total] = '\0';
         if (strstr(buf, "\r\n\r\n"))
             break;
     }
 
-    fprintf(stderr, "ws_handshake: received %zu bytes\n", total);
+    /* Check if this is a WebSocket upgrade or a plain HTTP request */
+    int is_upgrade = (strstr(buf, "Upgrade: websocket") != NULL ||
+                      strstr(buf, "Upgrade: WebSocket") != NULL ||
+                      strstr(buf, "upgrade: websocket") != NULL);
+
+    if (!is_upgrade) {
+        /* Plain HTTP GET — serve the HTML file */
+        return serve_http_file(fd, html_path);
+    }
 
     /* Find Sec-WebSocket-Key header (case-insensitive search) */
     char *pos = NULL;
@@ -138,11 +192,7 @@ int ws_do_handshake(int fd)
         }
     }
 
-    if (!pos) {
-        fprintf(stderr, "ws_handshake: Sec-WebSocket-Key not found\n");
-        fprintf(stderr, "ws_handshake: request was:\n%s\n", buf);
-        return -1;
-    }
+    if (!pos) return -1;
 
     while (*pos == ' ') pos++;
 
@@ -151,8 +201,6 @@ int ws_do_handshake(int fd)
     while (*pos && *pos != '\r' && *pos != '\n' && *pos != ' ' && i < 126)
         key[i++] = *pos++;
     key[i] = '\0';
-
-    fprintf(stderr, "ws_handshake: key='%s' (%d chars)\n", key, i);
 
     /* Compute accept value: SHA1(key + GUID) then base64 */
     char combined[256];
@@ -163,8 +211,6 @@ int ws_do_handshake(int fd)
 
     char accept[64];
     base64_encode(hash, 20, accept);
-
-    fprintf(stderr, "ws_handshake: accept='%s'\n", accept);
 
     /* Send response */
     char response[512];

@@ -12,11 +12,12 @@
 #define WS_OP_PONG   0xA
 
 /*
- * Perform the WebSocket handshake on an accepted connection.
- * Reads the HTTP upgrade request and sends the 101 response.
- * Returns 0 on success, -1 on error.
+ * Handle an incoming HTTP request on the WebSocket port.
+ * If it's a WebSocket upgrade: perform handshake, return 0.
+ * If it's a plain HTTP GET: serve the file at html_path, return 1.
+ * On error: return -1.
  */
-int ws_do_handshake(int fd);
+int ws_do_handshake(int fd, const char *html_path);
 
 /*
  * Send a binary WebSocket frame (server-to-client, unmasked).

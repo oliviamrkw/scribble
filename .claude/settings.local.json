@@ -13,7 +13,8 @@
       "Bash(python3 -c \"import websocket; print\\('websocket-client available'\\)\")",
       "Bash(pip3 install:*)",
       "Bash(python3 -c ':*)",
-      "Bash(printf '%s' 'dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-5AB9DC11E85A')"
+      "Bash(printf '%s' 'dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-5AB9DC11E85A')",
+      "Bash(pkill -9 -f \"./server\")"
     ]
   }
 }

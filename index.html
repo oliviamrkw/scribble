@@ -166,11 +166,9 @@ body {
 <div id="login-screen">
     <h1>Scribble</h1>
     <input type="text" id="name-input" placeholder="Enter your name" maxlength="31" autofocus>
-    <input type="text" id="host-input" placeholder="Server host" value="localhost">
-    <input type="number" id="port-input" placeholder="WS Port" value="4243">
-    <div style="font-size: 12px; color: #888; max-width: 300px; text-align: center;">
-        If using WSL2, try your WSL IP instead of localhost.<br>
-        Run <code style="color:#e94560;">hostname -I</code> in WSL to find it.
+    <div id="host-port-fields" style="display:none; gap:8px; flex-direction:column; align-items:center;">
+        <input type="text" id="host-input" placeholder="Server host" value="localhost" style="padding:8px 12px; font-size:14px; border:1px solid #555; border-radius:6px; background:#16213e; color:#eee; width:300px; outline:none;">
+        <input type="number" id="port-input" placeholder="WS Port" value="4243" style="padding:8px 12px; font-size:14px; border:1px solid #555; border-radius:6px; background:#16213e; color:#eee; width:300px; outline:none;">
     </div>
     <button id="join-btn">Join Game</button>
     <div id="login-error" style="color: #e94560;"></div>
@@ -529,10 +527,23 @@ function doJoin() {
         document.getElementById('login-error').textContent = 'Please enter a name.';
         return;
     }
-    const host = document.getElementById('host-input').value.trim() || 'localhost';
-    const port = document.getElementById('port-input').value.trim() || '4243';
+    /* Auto-detect host/port from the page URL when served over HTTP */
+    let host, port;
+    if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+        host = window.location.hostname;
+        port = parseInt(window.location.port) || 4243;
+    } else {
+        /* file:// fallback — use manual fields */
+        host = document.getElementById('host-input').value.trim() || 'localhost';
+        port = parseInt(document.getElementById('port-input').value.trim()) || 4243;
+    }
     playerName = name;
-    connect(host, parseInt(port), name);
+    connect(host, port, name);
+}
+
+/* Show manual host/port fields only when opened via file:// */
+if (window.location.protocol === 'file:') {
+    document.getElementById('host-port-fields').style.display = 'flex';
 }
 </script>
 </body>
