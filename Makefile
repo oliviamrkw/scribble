@@ -4,13 +4,13 @@ CFLAGS = -Wall -Wextra -std=c99 -DPORT=$(PORT)
 
 all: server client
 
-server: server.o net.o
+server: server.o net.o game.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 client: client.o net.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-%.o: %.c net.h
+%.o: %.c net.h game.h
 	$(CC) $(CFLAGS) -c $<
 
 clean:

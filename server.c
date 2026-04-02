@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200112L
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,9 +10,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include <time.h>
 #include "net.h"
+#include "game.h"
 
 #define BACKLOG 5
+#define WORDS_FILE "words.txt"
 
 #ifndef PORT
 #define PORT DEFAULT_PORT
@@ -24,6 +29,9 @@ typedef struct {
 
 static client_info_t clients[MAX_PLAYERS];
 static int listen_fd = -1;
+static game_state_t *game = NULL;
+static time_t round_start_time = 0;
+static int last_countdown = -1;  /* Last countdown value broadcast */
 
 static void init_clients(void)
 {
@@ -34,10 +42,6 @@ static void init_clients(void)
     }
 }
 
-/*
- * Find an empty slot in the clients array.
- * Returns the index, or -1 if the server is full.
- */
 static int find_empty_slot(void)
 {
     for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -47,10 +51,191 @@ static int find_empty_slot(void)
     return -1;
 }
 
+static void send_chat(int fd, const char *text)
+{
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = MSG_CHAT;
+    msg.length = (uint32_t)strlen(text);
+    if (msg.length > MAX_PAYLOAD)
+        msg.length = MAX_PAYLOAD;
+    memcpy(msg.payload, text, msg.length);
+    send_message(fd, &msg);
+}
+
+static void broadcast_chat(const char *text)
+{
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (clients[i].fd != -1)
+            send_chat(clients[i].fd, text);
+    }
+}
+
+static void remove_client(int slot);
+static void start_round(void);
+
+static void broadcast_to_clients(const message_t *msg, int skip_slot)
+{
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (clients[i].fd != -1 && i != skip_slot) {
+            if (send_message(clients[i].fd, msg) < 0) {
+                fprintf(stderr, "Failed to send to slot %d, removing\n", i);
+                remove_client(i);
+            }
+        }
+    }
+}
+
+static int count_active_clients(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (clients[i].fd != -1 && clients[i].active)
+            n++;
+    }
+    return n;
+}
+
 /*
- * Accept a new client connection and store it in the clients array.
- * Returns the slot index on success, -1 if full or on error.
+ * Show final scoreboard after all rounds are done.
  */
+static void show_final_scoreboard(void)
+{
+    char buf[MAX_PAYLOAD];
+    int pos = snprintf(buf, sizeof(buf),
+        "\n============================\n"
+        "       GAME OVER!\n"
+        "============================\n\n"
+        "Final Scoreboard:\n");
+
+    /* Find the winner */
+    uint32_t max_score = 0;
+    for (uint32_t i = 0; i < game->num_players; i++) {
+        if (game->players[i].score > max_score)
+            max_score = game->players[i].score;
+    }
+
+    for (uint32_t i = 0; i < game->num_players && pos < (int)sizeof(buf) - 1; i++) {
+        const char *trophy = (game->players[i].score == max_score) ? " <-- WINNER!" : "";
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+            "  %s: %u pts%s\n",
+            game->players[i].name,
+            game->players[i].score,
+            trophy);
+    }
+    snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+        "\nThanks for playing!\n");
+
+    broadcast_chat(buf);
+
+    /* Reset for a new game */
+    game->game_started = 0;
+    game->round_num = 0;
+}
+
+/*
+ * End the current round. If more rounds remain, auto-start the next one.
+ */
+static void end_round(const char *reason)
+{
+    game->round_active = 0;
+
+    /* Artist points are awarded incrementally during the round,
+     * so no end-of-round artist scoring needed. */
+
+    /* Build round scoreboard */
+    char buf[MAX_PAYLOAD];
+    int pos = snprintf(buf, sizeof(buf),
+        "\n=== Round %u/%u Over (%s) ===\nThe word was: %s\n\nScoreboard:\n",
+        game->round_num, game->total_rounds, reason, game->secret_word);
+
+    for (uint32_t i = 0; i < game->num_players && pos < (int)sizeof(buf) - 1; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+            "  %s: %u pts%s\n",
+            game->players[i].name,
+            game->players[i].score,
+            game->players[i].is_artist ? " (drawer)" : "");
+    }
+
+    broadcast_chat(buf);
+
+    /* Check if game is over */
+    if (game_is_over(game)) {
+        show_final_scoreboard();
+    } else {
+        /* Auto-start next round after a brief message */
+        char next[128];
+        snprintf(next, sizeof(next),
+            "\nNext round starting...\n");
+        broadcast_chat(next);
+        start_round();
+    }
+}
+
+static void start_round(void)
+{
+    if (game->num_players < 2) {
+        broadcast_chat("Need at least 2 players to start. Waiting...\n");
+        game->game_started = 0;
+        return;
+    }
+
+    game_start_round(game);
+    round_start_time = time(NULL);
+    last_countdown = ROUND_TIME_SEC;
+
+    char hint[MAX_NAME_LEN * 2 + 1];
+    game_get_hint(game, hint, sizeof(hint));
+
+    /* Notify each client */
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (clients[i].fd == -1 || !clients[i].active)
+            continue;
+
+        int is_artist = 0;
+        for (uint32_t p = 0; p < game->num_players; p++) {
+            if (game->players[p].id == (uint32_t)i) {
+                is_artist = game->players[p].is_artist;
+                break;
+            }
+        }
+
+        message_t msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_type = MSG_ROUND_START;
+        msg.payload[0] = (unsigned char)is_artist;
+
+        if (is_artist) {
+            char text[MAX_PAYLOAD - 1];
+            snprintf(text, sizeof(text),
+                "\n=== Round %u/%u ===\n"
+                "You are the DRAWER! The word is: %.*s\n"
+                "Hint shown to guessers: %.*s\n"
+                "Wait for others to guess. (60 seconds)\n",
+                game->round_num, game->total_rounds,
+                MAX_NAME_LEN, game->secret_word,
+                MAX_NAME_LEN * 2, hint);
+            uint32_t tlen = (uint32_t)strlen(text);
+            memcpy(msg.payload + 1, text, tlen);
+            msg.length = 1 + tlen;
+        } else {
+            char text[MAX_PAYLOAD - 1];
+            snprintf(text, sizeof(text),
+                "\n=== Round %u/%u ===\n"
+                "Guess the word! (%u letters): %.*s\n"
+                "Type your guess below. (60 seconds)\n",
+                game->round_num, game->total_rounds,
+                (uint32_t)strlen(game->secret_word),
+                MAX_NAME_LEN * 2, hint);
+            uint32_t tlen = (uint32_t)strlen(text);
+            memcpy(msg.payload + 1, text, tlen);
+            msg.length = 1 + tlen;
+        }
+
+        send_message(clients[i].fd, &msg);
+    }
+}
+
 static int accept_client(void)
 {
     struct sockaddr_in addr;
@@ -80,9 +265,6 @@ static int accept_client(void)
     return slot;
 }
 
-/*
- * Remove a client: close socket, clear slot, notify others.
- */
 static void remove_client(int slot)
 {
     if (slot < 0 || slot >= MAX_PLAYERS || clients[slot].fd == -1)
@@ -91,54 +273,32 @@ static void remove_client(int slot)
     printf("Removing client \"%s\" (slot %d, fd %d)\n",
            clients[slot].name, slot, clients[slot].fd);
 
-    close(clients[slot].fd);
-    clients[slot].fd = -1;
-    clients[slot].active = 0;
-    clients[slot].name[0] = '\0';
+    if (clients[slot].active) {
+        game_remove_player(game, (uint32_t)slot);
 
-    /* Count remaining active players */
-    int remaining = 0;
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (clients[i].fd != -1)
-            remaining++;
-    }
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s has disconnected.\n", clients[slot].name);
+        close(clients[slot].fd);
+        clients[slot].fd = -1;
+        clients[slot].active = 0;
+        clients[slot].name[0] = '\0';
+        broadcast_chat(buf);
 
-    /* Broadcast PLAYER_DISCONNECT to remaining clients */
-    message_t disc;
-    memset(&disc, 0, sizeof(disc));
-    disc.msg_type = MSG_PLAYER_DISCONNECT;
-    uint32_t net_id = htonl((uint32_t)slot);
-    uint32_t net_rem = htonl((uint32_t)remaining);
-    memcpy(disc.payload, &net_id, sizeof(net_id));
-    memcpy(disc.payload + sizeof(net_id), &net_rem, sizeof(net_rem));
-    disc.length = sizeof(net_id) + sizeof(net_rem);
-
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (clients[i].fd != -1) {
-            send_message(clients[i].fd, &disc);
-        }
-    }
-}
-
-/*
- * Send a message to all connected clients (optionally skip one slot).
- * If skip_slot is -1, send to everyone.
- */
-static void broadcast_to_clients(const message_t *msg, int skip_slot)
-{
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (clients[i].fd != -1 && i != skip_slot) {
-            if (send_message(clients[i].fd, msg) < 0) {
-                fprintf(stderr, "Failed to send to slot %d, removing\n", i);
-                remove_client(i);
+        if (game->round_active) {
+            if (game->num_players < 2) {
+                end_round("not enough players");
+            } else if (game_all_guessed(game)) {
+                end_round("everyone guessed it");
             }
         }
+    } else {
+        close(clients[slot].fd);
+        clients[slot].fd = -1;
+        clients[slot].active = 0;
+        clients[slot].name[0] = '\0';
     }
 }
 
-/*
- * Handle a PLAYER_JOIN message from a newly connected client.
- */
 static void handle_player_join(int slot, const message_t *msg)
 {
     if (msg->length < sizeof(uint32_t) + 1) {
@@ -162,12 +322,142 @@ static void handle_player_join(int slot, const message_t *msg)
     clients[slot].name[name_len] = '\0';
     clients[slot].active = 1;
 
+    game_add_player(game, (uint32_t)slot, clients[slot].name);
+
     printf("Player \"%s\" joined (slot %d)\n", clients[slot].name, slot);
+
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s has joined! (%d player(s) connected)\n",
+             clients[slot].name, count_active_clients());
+    broadcast_chat(buf);
+
+    if (!game->game_started) {
+        send_chat(clients[slot].fd,
+            "Welcome! Type \"play\" to start the game.\n");
+    } else if (game->round_active) {
+        send_chat(clients[slot].fd,
+            "A round is in progress. You'll join the next one.\n");
+    }
 }
 
-/*
- * Handle an incoming message from a connected client.
- */
+static void handle_guess(int slot, const message_t *msg)
+{
+    char guess[MAX_NAME_LEN + 256];
+    uint32_t len = msg->length;
+    if (len > sizeof(guess) - 1)
+        len = sizeof(guess) - 1;
+    memcpy(guess, msg->payload, len);
+    guess[len] = '\0';
+
+    /* Check for "play" command when no game/round is active */
+    if (!game->round_active && !game->game_started) {
+        if (strcasecmp(guess, "play") == 0) {
+            if (game->num_players < 2) {
+                send_chat(clients[slot].fd,
+                    "Need at least 2 players to start.\n");
+                return;
+            }
+            game->game_started = 1;
+            game->round_num = 0;
+            game->total_rounds = game->num_players;
+
+            /* Reset all scores for new game */
+            for (uint32_t i = 0; i < game->num_players; i++)
+                game->players[i].score = 0;
+
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                "%s started the game! (%u rounds)\n",
+                clients[slot].name, game->total_rounds);
+            broadcast_chat(buf);
+            start_round();
+        } else {
+            /* Lobby chat */
+            char buf[MAX_PAYLOAD];
+            snprintf(buf, sizeof(buf), "[%s] %s\n", clients[slot].name, guess);
+            broadcast_chat(buf);
+        }
+        return;
+    }
+
+    /* Between rounds but game is started — ignore or relay as chat */
+    if (!game->round_active && game->game_started) {
+        return;
+    }
+
+    /* Round is active — find this player */
+    player_t *player = NULL;
+    for (uint32_t i = 0; i < game->num_players; i++) {
+        if (game->players[i].id == (uint32_t)slot) {
+            player = &game->players[i];
+            break;
+        }
+    }
+
+    if (!player) {
+        send_chat(clients[slot].fd,
+            "You're not in the current round. Wait for the next one.\n");
+        return;
+    }
+
+    if (player->is_artist) {
+        send_chat(clients[slot].fd,
+            "You're the drawer! You can't guess.\n");
+        return;
+    }
+
+    if (player->has_guessed) {
+        send_chat(clients[slot].fd,
+            "You already guessed correctly! Wait for the round to end.\n");
+        return;
+    }
+
+    /* Check the guess */
+    if (game_validate_guess(game, guess)) {
+        uint32_t guesser_pts = game_get_guesser_points(game);
+        uint32_t artist_pts = game_get_artist_points_for_guess(game);
+        player->score += guesser_pts;
+
+        /* Award artist points */
+        for (uint32_t i = 0; i < game->num_players; i++) {
+            if (game->players[i].is_artist) {
+                game->players[i].score += artist_pts;
+                break;
+            }
+        }
+
+        game_mark_guessed(game, (uint32_t)slot);
+
+        /* Notify the guesser privately */
+        message_t notify;
+        memset(&notify, 0, sizeof(notify));
+        notify.msg_type = MSG_GUESSED_NOTIFY;
+        char nbuf[MAX_PAYLOAD];
+        snprintf(nbuf, sizeof(nbuf),
+            "Correct! You earned %u points! (Total: %u)\n",
+            guesser_pts, player->score);
+        notify.length = (uint32_t)strlen(nbuf);
+        memcpy(notify.payload, nbuf, notify.length);
+        send_message(clients[slot].fd, &notify);
+
+        /* Broadcast to everyone */
+        char buf[MAX_PAYLOAD];
+        snprintf(buf, sizeof(buf), "%s guessed the word! (+%u pts)\n",
+                 clients[slot].name, guesser_pts);
+        broadcast_chat(buf);
+
+        if (game_all_guessed(game)) {
+            end_round("everyone guessed it");
+        }
+    } else {
+        /* Wrong guess — show to all as [Name] guess */
+        char buf[MAX_PAYLOAD];
+        snprintf(buf, sizeof(buf), "[%s] %s\n",
+                 clients[slot].name, guess);
+        broadcast_chat(buf);
+    }
+}
+
 static void handle_client_message(int slot)
 {
     message_t msg;
@@ -183,17 +473,11 @@ static void handle_client_message(int slot)
         handle_player_join(slot, &msg);
         break;
 
-    case MSG_BRUSH_STROKE:
-        /* Artist sends stroke -> broadcast to all other clients */
-        broadcast_to_clients(&msg, slot);
+    case MSG_GUESS:
+        handle_guess(slot, &msg);
         break;
 
-    case MSG_GUESS:
-        /*
-         * TODO: integrate with game logic (Person B's game.c)
-         * For now, just forward to all other clients so they can see
-         * guesses in the chat.
-         */
+    case MSG_BRUSH_STROKE:
         broadcast_to_clients(&msg, slot);
         break;
 
@@ -205,8 +489,39 @@ static void handle_client_message(int slot)
 }
 
 /*
- * Build the fd_set for select(), return the highest fd.
+ * Broadcast countdown timer updates at key moments.
  */
+static void check_countdown(void)
+{
+    if (!game->round_active || round_start_time == 0)
+        return;
+
+    time_t elapsed = time(NULL) - round_start_time;
+    int remaining = ROUND_TIME_SEC - (int)elapsed;
+    if (remaining < 0)
+        remaining = 0;
+
+    /* Broadcast at these thresholds */
+    int should_broadcast = 0;
+    if (remaining <= 10 && remaining != last_countdown) {
+        /* Every second in the last 10 */
+        should_broadcast = 1;
+    } else if (remaining <= 30 && remaining % 10 == 0 && remaining != last_countdown) {
+        /* Every 10 seconds from 30 down */
+        should_broadcast = 1;
+    } else if (remaining % 15 == 0 && remaining != last_countdown && remaining < ROUND_TIME_SEC) {
+        /* Every 15 seconds otherwise */
+        should_broadcast = 1;
+    }
+
+    if (should_broadcast) {
+        last_countdown = remaining;
+        char buf[64];
+        snprintf(buf, sizeof(buf), ">>> %d seconds remaining <<<\n", remaining);
+        broadcast_chat(buf);
+    }
+}
+
 static int build_fdset(fd_set *readfds)
 {
     FD_ZERO(readfds);
@@ -267,19 +582,32 @@ int main(int argc, char *argv[])
 
     init_clients();
 
-    listen_fd = setup_server(port);
-    if (listen_fd < 0)
+    game = game_init();
+    if (!game) {
+        fprintf(stderr, "Failed to init game\n");
         exit(EXIT_FAILURE);
+    }
+
+    if (game_load_words(game, WORDS_FILE) < 0) {
+        fprintf(stderr, "Failed to load words from %s\n", WORDS_FILE);
+        game_cleanup(game);
+        exit(EXIT_FAILURE);
+    }
+
+    listen_fd = setup_server(port);
+    if (listen_fd < 0) {
+        game_cleanup(game);
+        exit(EXIT_FAILURE);
+    }
 
     printf("Server listening on port %d\n", port);
 
-    /* Main select() loop */
     while (1) {
         fd_set readfds;
         int maxfd = build_fdset(&readfds);
 
         struct timeval tv;
-        tv.tv_sec = ROUND_TIME_SEC;
+        tv.tv_sec = 1;
         tv.tv_usec = 0;
 
         int activity = select(maxfd + 1, &readfds, NULL, NULL, &tv);
@@ -290,17 +618,23 @@ int main(int argc, char *argv[])
             break;
         }
 
-        if (activity == 0) {
-            /* Timeout — will be used for round timer in later phases */
-            continue;
+        /* Check round timer */
+        if (game->round_active && round_start_time > 0) {
+            time_t elapsed = time(NULL) - round_start_time;
+            if (elapsed >= ROUND_TIME_SEC) {
+                end_round("time's up");
+            } else {
+                check_countdown();
+            }
         }
 
-        /* Check for new incoming connections */
+        if (activity == 0)
+            continue;
+
         if (FD_ISSET(listen_fd, &readfds)) {
             accept_client();
         }
 
-        /* Check each connected client for incoming data */
         for (int i = 0; i < MAX_PLAYERS; i++) {
             if (clients[i].fd != -1 &&
                 FD_ISSET(clients[i].fd, &readfds)) {
@@ -309,11 +643,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Cleanup */
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (clients[i].fd != -1)
             close(clients[i].fd);
     }
     close(listen_fd);
+    game_cleanup(game);
     return 0;
 }

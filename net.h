@@ -20,6 +20,8 @@
 #define MSG_CORRECT_GUESS     5
 #define MSG_ROUND_END         6
 #define MSG_PLAYER_DISCONNECT 7
+#define MSG_CHAT              8   /* Server relays a guess attempt with player name */
+#define MSG_GUESSED_NOTIFY    9   /* Tell a player they guessed correctly */
 
 /*
  * Wire format (network byte order):

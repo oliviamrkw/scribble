@@ -25,6 +25,10 @@
 #define PORT DEFAULT_PORT
 #endif
 
+/* Client state */
+static int is_artist = 0;
+static int has_guessed = 0;
+
 /*
  * Build and send a PLAYER_JOIN message.
  * Payload: [4 bytes name_len (network order)] [name_len bytes name]
@@ -66,7 +70,6 @@ static void handle_server_message(const message_t *msg)
 {
     switch (msg->msg_type) {
     case MSG_PLAYER_JOIN:
-        /* Another player joined — extract their name */
         if (msg->length > sizeof(uint32_t)) {
             uint32_t nlen;
             memcpy(&nlen, msg->payload, sizeof(nlen));
@@ -80,16 +83,29 @@ static void handle_server_message(const message_t *msg)
         }
         break;
 
-    case MSG_ROUND_START:
-        printf("[Server] Round started!\n");
+    case MSG_ROUND_START: {
+        /* payload: [1 byte is_artist] [text] */
+        if (msg->length < 2)
+            break;
+        is_artist = msg->payload[0];
+        has_guessed = 0;
+
+        uint32_t tlen = msg->length - 1;
+        if (tlen > MAX_PAYLOAD - 1)
+            tlen = MAX_PAYLOAD - 1;
+        char text[MAX_PAYLOAD];
+        memcpy(text, msg->payload + 1, tlen);
+        text[tlen] = '\0';
+        printf("%s", text);
+        fflush(stdout);
         break;
+    }
 
     case MSG_BRUSH_STROKE:
         printf("[Server] Brush stroke received (%u bytes)\n", msg->length);
         break;
 
     case MSG_GUESS: {
-        /* Print the guess text */
         uint32_t len = msg->length;
         if (len > MAX_PAYLOAD)
             len = MAX_PAYLOAD;
@@ -100,11 +116,39 @@ static void handle_server_message(const message_t *msg)
         break;
     }
 
+    case MSG_CHAT: {
+        uint32_t len = msg->length;
+        if (len > MAX_PAYLOAD)
+            len = MAX_PAYLOAD;
+        char buf[MAX_PAYLOAD + 1];
+        memcpy(buf, msg->payload, len);
+        buf[len] = '\0';
+        printf("%s", buf);
+        fflush(stdout);
+        break;
+    }
+
+    case MSG_GUESSED_NOTIFY: {
+        uint32_t len = msg->length;
+        if (len > MAX_PAYLOAD)
+            len = MAX_PAYLOAD;
+        char buf[MAX_PAYLOAD + 1];
+        memcpy(buf, msg->payload, len);
+        buf[len] = '\0';
+        has_guessed = 1;
+        printf("%s", buf);
+        fflush(stdout);
+        break;
+    }
+
     case MSG_CORRECT_GUESS:
         printf("[Server] Correct guess!\n");
         break;
 
     case MSG_ROUND_END:
+        /* Reset state for next round */
+        is_artist = 0;
+        has_guessed = 0;
         printf("[Server] Round ended\n");
         break;
 
@@ -146,8 +190,8 @@ int main(int argc, char *argv[])
     /* Use getaddrinfo to resolve hostname */
     struct addrinfo hints, *result, *rp;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;           /* IPv4 only */
-    hints.ai_socktype = SOCK_STREAM;     /* TCP */
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
 
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
@@ -158,18 +202,13 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    /* Try each address returned by getaddrinfo */
     int sock = -1;
     for (rp = result; rp != NULL; rp = rp->ai_next) {
         sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sock < 0) {
+        if (sock < 0)
             continue;
-        }
-
-        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
-            break;  /* Successfully connected */
-        }
-
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0)
+            break;
         close(sock);
         sock = -1;
     }
@@ -185,7 +224,7 @@ int main(int argc, char *argv[])
 
     int sockfd = sock;
 
-    /* Send PLAYER_JOIN */
+    /* Get player name */
     char name[MAX_NAME_LEN];
     printf("Enter your name: ");
     fflush(stdout);
@@ -196,7 +235,6 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    /* Remove trailing newline */
     size_t name_len = strlen(name);
     if (name_len > 0 && name[name_len - 1] == '\n') {
         name[name_len - 1] = '\0';
@@ -209,16 +247,15 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    /* Send join message */
     if (send_player_join(sockfd, name) < 0) {
         fprintf(stderr, "Failed to send join message\n");
         close(sockfd);
         return 1;
     }
 
-    printf("Joined as \"%s\". Type your guesses below.\n", name);
+    printf("Joined as \"%s\".\n", name);
 
-    /* Main select() loop: monitor stdin and server socket */
+    /* Main select() loop */
     while (1) {
         fd_set readfds;
         FD_ZERO(&readfds);
@@ -235,19 +272,19 @@ int main(int argc, char *argv[])
             break;
         }
 
-        /* Check for input from stdin */
+        /* stdin input */
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
             char line[MAX_PAYLOAD];
             if (fgets(line, sizeof(line), stdin) == NULL) {
-                /* EOF on stdin — user quit */
                 printf("Disconnecting...\n");
                 break;
             }
-            /* Strip trailing newline */
             size_t len = strlen(line);
             if (len > 0 && line[len - 1] == '\n')
                 line[--len] = '\0';
+
             if (len > 0) {
+                /* Send everything to server; server enforces rules */
                 if (send_guess(sockfd, line, (uint32_t)len) < 0) {
                     fprintf(stderr, "Lost connection to server\n");
                     break;
@@ -255,7 +292,7 @@ int main(int argc, char *argv[])
             }
         }
 
-        /* Check for data from server */
+        /* Server data */
         if (FD_ISSET(sockfd, &readfds)) {
             message_t msg;
             memset(&msg, 0, sizeof(msg));
