@@ -14,11 +14,9 @@
 #include <signal.h>
 #include "net.h"
 #include "game.h"
-#include "websocket.h"
 
 #define BACKLOG 5
 #define WORDS_FILE "words.txt"
-#define HTML_FILE  "index.html"
 
 #ifndef PORT
 #define PORT DEFAULT_PORT
@@ -28,16 +26,14 @@ typedef struct {
     int fd;
     char name[MAX_NAME_LEN];
     int active;
-    int is_websocket;
-    int ws_handshake_done;
 } client_info_t;
 
 static client_info_t clients[MAX_PLAYERS];
 static int listen_fd = -1;
-static int ws_listen_fd = -1;
 static game_state_t *game = NULL;
 static time_t round_start_time = 0;
-static int last_countdown = -1;  /* Last countdown value broadcast */
+static int last_countdown = -1;
+static uint8_t canvas[CANVAS_ROWS][CANVAS_COLS];
 
 static void init_clients(void)
 {
@@ -45,9 +41,8 @@ static void init_clients(void)
         clients[i].fd = -1;
         clients[i].name[0] = '\0';
         clients[i].active = 0;
-        clients[i].is_websocket = 0;
-        clients[i].ws_handshake_done = 0;
     }
+    memset(canvas, 0, sizeof(canvas));
 }
 
 static int find_empty_slot(void)
@@ -59,48 +54,13 @@ static int find_empty_slot(void)
     return -1;
 }
 
-/*
- * Send a message to a client, handling WebSocket framing if needed.
- */
 static int server_send_msg(int slot, const message_t *msg)
 {
-    if (clients[slot].is_websocket) {
-        /* Serialize TLV into a buffer, then send as WS binary frame */
-        uint8_t buf[8 + MAX_PAYLOAD];
-        uint32_t net_type = htonl(msg->msg_type);
-        uint32_t net_len  = htonl(msg->length);
-        memcpy(buf, &net_type, 4);
-        memcpy(buf + 4, &net_len, 4);
-        if (msg->length > 0)
-            memcpy(buf + 8, msg->payload, msg->length);
-        return ws_send_frame(clients[slot].fd, buf, 8 + msg->length);
-    }
     return send_message(clients[slot].fd, msg);
 }
 
-/*
- * Receive a message from a client, handling WebSocket framing if needed.
- */
 static int server_recv_msg(int slot, message_t *msg)
 {
-    if (clients[slot].is_websocket) {
-        uint8_t buf[8 + MAX_PAYLOAD];
-        uint8_t opcode;
-        int n = ws_recv_frame(clients[slot].fd, buf, sizeof(buf), &opcode);
-        if (n <= 0) return -1;
-        if (opcode == WS_OP_CLOSE) return -1;
-        if (n < 8) return -1;
-
-        uint32_t net_type, net_len;
-        memcpy(&net_type, buf, 4);
-        memcpy(&net_len, buf + 4, 4);
-        msg->msg_type = ntohl(net_type);
-        msg->length   = ntohl(net_len);
-        if (msg->length > MAX_PAYLOAD) return -1;
-        if (msg->length > 0)
-            memcpy(msg->payload, buf + 8, msg->length);
-        return 0;
-    }
     return recv_message(clients[slot].fd, msg);
 }
 
@@ -149,9 +109,6 @@ static int count_active_clients(void)
     return n;
 }
 
-/*
- * Show final scoreboard after all rounds are done.
- */
 static void show_final_scoreboard(void)
 {
     char buf[MAX_PAYLOAD];
@@ -161,7 +118,6 @@ static void show_final_scoreboard(void)
         "============================\n\n"
         "Final Scoreboard:\n");
 
-    /* Find the winner */
     uint32_t max_score = 0;
     for (uint32_t i = 0; i < game->num_players; i++) {
         if (game->players[i].score > max_score)
@@ -181,22 +137,14 @@ static void show_final_scoreboard(void)
 
     broadcast_chat(buf);
 
-    /* Reset for a new game */
     game->game_started = 0;
     game->round_num = 0;
 }
 
-/*
- * End the current round. If more rounds remain, auto-start the next one.
- */
 static void end_round(const char *reason)
 {
     game->round_active = 0;
 
-    /* Artist points are awarded incrementally during the round,
-     * so no end-of-round artist scoring needed. */
-
-    /* Build round scoreboard */
     char buf[MAX_PAYLOAD];
     int pos = snprintf(buf, sizeof(buf),
         "\n=== Round %u/%u Over (%s) ===\nThe word was: %s\n\nScoreboard:\n",
@@ -212,17 +160,28 @@ static void end_round(const char *reason)
 
     broadcast_chat(buf);
 
-    /* Check if game is over */
     if (game_is_over(game)) {
         show_final_scoreboard();
     } else {
-        /* Auto-start next round after a brief message */
         char next[128];
         snprintf(next, sizeof(next),
             "\nNext round starting...\n");
         broadcast_chat(next);
         start_round();
     }
+}
+
+/*
+ * Send the full canvas state to a single client.
+ */
+static void send_canvas_sync(int slot)
+{
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = MSG_CANVAS_SYNC;
+    msg.length = CANVAS_ROWS * CANVAS_COLS;
+    memcpy(msg.payload, canvas, msg.length);
+    server_send_msg(slot, &msg);
 }
 
 static void start_round(void)
@@ -237,8 +196,18 @@ static void start_round(void)
     round_start_time = time(NULL);
     last_countdown = ROUND_TIME_SEC;
 
+    /* Clear the canvas for the new round */
+    memset(canvas, 0, sizeof(canvas));
+
     char hint[MAX_NAME_LEN * 2 + 1];
     game_get_hint(game, hint, sizeof(hint));
+
+    /* Broadcast canvas clear to all clients */
+    message_t clear_msg;
+    memset(&clear_msg, 0, sizeof(clear_msg));
+    clear_msg.msg_type = MSG_DRAW_CLEAR;
+    clear_msg.length = 0;
+    broadcast_to_clients(&clear_msg, -1);
 
     /* Notify each client */
     for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -264,7 +233,8 @@ static void start_round(void)
                 "\n=== Round %u/%u ===\n"
                 "You are the DRAWER! The word is: %.*s\n"
                 "Hint shown to guessers: %.*s\n"
-                "Wait for others to guess. (60 seconds)\n",
+                "Use arrow keys to move, Space to draw, C for color, Z to clear\n"
+                "Press Tab to switch to chat mode (60 seconds)\n",
                 game->round_num, game->total_rounds,
                 MAX_NAME_LEN, game->secret_word,
                 MAX_NAME_LEN * 2, hint);
@@ -311,41 +281,8 @@ static int accept_client(void)
     clients[slot].fd = client_fd;
     clients[slot].active = 0;
     clients[slot].name[0] = '\0';
-    clients[slot].is_websocket = 0;
-    clients[slot].ws_handshake_done = 0;
 
     printf("New connection from %s:%d (slot %d, fd %d)\n",
-           inet_ntoa(addr.sin_addr), ntohs(addr.sin_port),
-           slot, client_fd);
-    return slot;
-}
-
-static int accept_ws_client(void)
-{
-    struct sockaddr_in addr;
-    socklen_t addrlen = sizeof(addr);
-
-    int client_fd = accept(ws_listen_fd, (struct sockaddr *)&addr, &addrlen);
-    if (client_fd < 0) {
-        perror("accept (ws)");
-        return -1;
-    }
-
-    int slot = find_empty_slot();
-    if (slot < 0) {
-        fprintf(stderr, "Server full, rejecting WS %s:%d\n",
-                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
-        close(client_fd);
-        return -1;
-    }
-
-    clients[slot].fd = client_fd;
-    clients[slot].active = 0;
-    clients[slot].name[0] = '\0';
-    clients[slot].is_websocket = 1;
-    clients[slot].ws_handshake_done = 0;
-
-    printf("New WebSocket connection from %s:%d (slot %d, fd %d)\n",
            inet_ntoa(addr.sin_addr), ntohs(addr.sin_port),
            slot, client_fd);
     return slot;
@@ -383,8 +320,6 @@ static void remove_client(int slot)
         clients[slot].active = 0;
         clients[slot].name[0] = '\0';
     }
-    clients[slot].is_websocket = 0;
-    clients[slot].ws_handshake_done = 0;
 }
 
 static void handle_player_join(int slot, const message_t *msg)
@@ -425,6 +360,8 @@ static void handle_player_join(int slot, const message_t *msg)
     } else if (game->round_active) {
         send_chat_to_slot(slot,
             "A round is in progress. You'll join the next one.\n");
+        /* Send current canvas state to the new player */
+        send_canvas_sync(slot);
     }
 }
 
@@ -449,7 +386,6 @@ static void handle_guess(int slot, const message_t *msg)
             game->round_num = 0;
             game->total_rounds = game->num_players;
 
-            /* Reset all scores for new game */
             for (uint32_t i = 0; i < game->num_players; i++)
                 game->players[i].score = 0;
 
@@ -460,7 +396,6 @@ static void handle_guess(int slot, const message_t *msg)
             broadcast_chat(buf);
             start_round();
         } else {
-            /* Lobby chat */
             char buf[MAX_PAYLOAD];
             snprintf(buf, sizeof(buf), "[%s] %s\n", clients[slot].name, guess);
             broadcast_chat(buf);
@@ -468,7 +403,6 @@ static void handle_guess(int slot, const message_t *msg)
         return;
     }
 
-    /* Between rounds but game is started — ignore or relay as chat */
     if (!game->round_active && game->game_started) {
         return;
     }
@@ -500,13 +434,11 @@ static void handle_guess(int slot, const message_t *msg)
         return;
     }
 
-    /* Check the guess */
     if (game_validate_guess(game, guess)) {
         uint32_t guesser_pts = game_get_guesser_points(game);
         uint32_t artist_pts = game_get_artist_points_for_guess(game);
         player->score += guesser_pts;
 
-        /* Award artist points */
         for (uint32_t i = 0; i < game->num_players; i++) {
             if (game->players[i].is_artist) {
                 game->players[i].score += artist_pts;
@@ -516,7 +448,6 @@ static void handle_guess(int slot, const message_t *msg)
 
         game_mark_guessed(game, (uint32_t)slot);
 
-        /* Notify the guesser privately */
         message_t notify;
         memset(&notify, 0, sizeof(notify));
         notify.msg_type = MSG_GUESSED_NOTIFY;
@@ -528,7 +459,6 @@ static void handle_guess(int slot, const message_t *msg)
         memcpy(notify.payload, nbuf, notify.length);
         server_send_msg(slot, &notify);
 
-        /* Broadcast to everyone */
         char buf[MAX_PAYLOAD];
         snprintf(buf, sizeof(buf), "%s guessed the word! (+%u pts)\n",
                  clients[slot].name, guesser_pts);
@@ -538,7 +468,6 @@ static void handle_guess(int slot, const message_t *msg)
             end_round("everyone guessed it");
         }
     } else {
-        /* Wrong guess — show to all as [Name] guess */
         char buf[MAX_PAYLOAD];
         snprintf(buf, sizeof(buf), "[%s] %s\n",
                  clients[slot].name, guess);
@@ -546,31 +475,61 @@ static void handle_guess(int slot, const message_t *msg)
     }
 }
 
-static void handle_client_message(int slot)
+static void handle_draw_cell(int slot, const message_t *msg)
 {
-    /* WebSocket clients need handshake first */
-    if (clients[slot].is_websocket && !clients[slot].ws_handshake_done) {
-        int hs = ws_do_handshake(clients[slot].fd, HTML_FILE);
-        if (hs < 0) {
-            fprintf(stderr, "WebSocket handshake failed for slot %d\n", slot);
-            remove_client(slot);
-            return;
-        }
-        if (hs == 1) {
-            /* Served HTTP page, close connection (not a WebSocket) */
-            printf("Served index.html to slot %d\n", slot);
-            close(clients[slot].fd);
-            clients[slot].fd = -1;
-            clients[slot].active = 0;
-            clients[slot].is_websocket = 0;
-            clients[slot].ws_handshake_done = 0;
-            return;
-        }
-        clients[slot].ws_handshake_done = 1;
-        printf("WebSocket handshake complete (slot %d)\n", slot);
+    if (msg->length < 3)
         return;
+
+    /* Only the artist can draw */
+    if (game->round_active) {
+        int is_artist = 0;
+        for (uint32_t i = 0; i < game->num_players; i++) {
+            if (game->players[i].id == (uint32_t)slot && game->players[i].is_artist) {
+                is_artist = 1;
+                break;
+            }
+        }
+        if (!is_artist)
+            return;
     }
 
+    uint8_t row = msg->payload[0];
+    uint8_t col = msg->payload[1];
+    uint8_t color = msg->payload[2];
+
+    if (row >= CANVAS_ROWS || col >= CANVAS_COLS || color >= NUM_COLORS)
+        return;
+
+    canvas[row][col] = color;
+    broadcast_to_clients(msg, slot);
+}
+
+static void handle_draw_clear(int slot)
+{
+    /* Only the artist can clear */
+    if (game->round_active) {
+        int is_artist = 0;
+        for (uint32_t i = 0; i < game->num_players; i++) {
+            if (game->players[i].id == (uint32_t)slot && game->players[i].is_artist) {
+                is_artist = 1;
+                break;
+            }
+        }
+        if (!is_artist)
+            return;
+    }
+
+    memset(canvas, 0, sizeof(canvas));
+
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = MSG_DRAW_CLEAR;
+    msg.length = 0;
+    broadcast_to_clients(&msg, slot);
+}
+
+static void handle_client_message(int slot)
+{
     message_t msg;
     memset(&msg, 0, sizeof(msg));
 
@@ -588,13 +547,12 @@ static void handle_client_message(int slot)
         handle_guess(slot, &msg);
         break;
 
-    case MSG_BRUSH_STROKE:
-    case MSG_DRAW_LINE:
-        broadcast_to_clients(&msg, slot);
+    case MSG_DRAW_CELL:
+        handle_draw_cell(slot, &msg);
         break;
 
     case MSG_DRAW_CLEAR:
-        broadcast_to_clients(&msg, -1);
+        handle_draw_clear(slot);
         break;
 
     default:
@@ -604,9 +562,6 @@ static void handle_client_message(int slot)
     }
 }
 
-/*
- * Broadcast countdown timer updates at key moments.
- */
 static void check_countdown(void)
 {
     if (!game->round_active || round_start_time == 0)
@@ -617,16 +572,12 @@ static void check_countdown(void)
     if (remaining < 0)
         remaining = 0;
 
-    /* Broadcast at these thresholds */
     int should_broadcast = 0;
     if (remaining <= 10 && remaining != last_countdown) {
-        /* Every second in the last 10 */
         should_broadcast = 1;
     } else if (remaining <= 30 && remaining % 10 == 0 && remaining != last_countdown) {
-        /* Every 10 seconds from 30 down */
         should_broadcast = 1;
     } else if (remaining % 15 == 0 && remaining != last_countdown && remaining < ROUND_TIME_SEC) {
-        /* Every 15 seconds otherwise */
         should_broadcast = 1;
     }
 
@@ -643,12 +594,6 @@ static int build_fdset(fd_set *readfds)
     FD_ZERO(readfds);
     FD_SET(listen_fd, readfds);
     int maxfd = listen_fd;
-
-    if (ws_listen_fd != -1) {
-        FD_SET(ws_listen_fd, readfds);
-        if (ws_listen_fd > maxfd)
-            maxfd = ws_listen_fd;
-    }
 
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (clients[i].fd != -1) {
@@ -724,17 +669,8 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    ws_listen_fd = setup_server(port + 1);
-    if (ws_listen_fd < 0) {
-        fprintf(stderr, "Warning: could not start WebSocket listener on port %d\n",
-                port + 1);
-    }
-
-    printf("Server listening on port %d (TCP) and %d (WebSocket)\n",
-           port, port + 1);
-    printf("Open index.html in your browser and connect to localhost:%d\n",
-           port + 1);
-    printf("(If using WSL2, run 'hostname -I' to find your WSL IP)\n");
+    printf("Server listening on port %d\n", port);
+    printf("Clients can connect with: ./client <host> %d\n", port);
 
     while (1) {
         fd_set readfds;
@@ -769,10 +705,6 @@ int main(int argc, char *argv[])
             accept_client();
         }
 
-        if (ws_listen_fd != -1 && FD_ISSET(ws_listen_fd, &readfds)) {
-            accept_ws_client();
-        }
-
         for (int i = 0; i < MAX_PLAYERS; i++) {
             if (clients[i].fd != -1 &&
                 FD_ISSET(clients[i].fd, &readfds)) {
@@ -786,8 +718,6 @@ int main(int argc, char *argv[])
             close(clients[i].fd);
     }
     close(listen_fd);
-    if (ws_listen_fd != -1)
-        close(ws_listen_fd);
     game_cleanup(game);
     return 0;
 }

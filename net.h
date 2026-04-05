@@ -5,24 +5,25 @@
 #include <stddef.h>
 
 #define DEFAULT_PORT    4242
-#define MAX_PAYLOAD     512
+#define MAX_PAYLOAD     1024
 #define MAX_PLAYERS     6
 #define MAX_NAME_LEN    32
 #define ROUND_TIME_SEC  60
-#define CANVAS_WIDTH    1024
-#define CANVAS_HEIGHT   768
+#define CANVAS_COLS     40
+#define CANVAS_ROWS     20
+#define NUM_COLORS      8
 
 /* Message type IDs */
 #define MSG_PLAYER_JOIN       1
 #define MSG_ROUND_START       2
-#define MSG_BRUSH_STROKE      3
+#define MSG_DRAW_CELL         3   /* Single cell update: row, col, color_index */
 #define MSG_GUESS             4
 #define MSG_CORRECT_GUESS     5
 #define MSG_ROUND_END         6
 #define MSG_PLAYER_DISCONNECT 7
 #define MSG_CHAT              8   /* Server relays a guess attempt with player name */
 #define MSG_GUESSED_NOTIFY    9   /* Tell a player they guessed correctly */
-#define MSG_DRAW_LINE        10   /* Line segment drawing data */
+#define MSG_CANVAS_SYNC      10   /* Full canvas state for late joiners */
 #define MSG_DRAW_CLEAR       11   /* Clear the canvas */
 
 /*
