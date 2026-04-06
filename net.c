@@ -39,7 +39,6 @@ int read_all(int fd, void *buf, size_t n)
             return -1;
         }
         if (nread == 0) {
-            /* Peer closed connection */
             return -1;
         }
         p += nread;
