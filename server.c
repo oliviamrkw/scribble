@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -21,6 +22,14 @@
 #define PORT DEFAULT_PORT
 #endif
 
+static volatile sig_atomic_t got_sigint = 0;
+
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    got_sigint = 1;
+}
+
 typedef struct {
     int fd;
     char name[MAX_NAME_LEN];
@@ -31,7 +40,7 @@ static client_info_t clients[MAX_PLAYERS];
 static int listen_fd = -1;
 static game_state_t *game = NULL;
 static time_t round_start_time = 0;
-static int last_countdown = -1;  /* Last countdown value broadcast */
+static int last_countdown = -1;
 
 static void init_clients(void)
 {
@@ -51,7 +60,10 @@ static int find_empty_slot(void)
     return -1;
 }
 
-static void send_chat(int fd, const char *text)
+static void remove_client(int slot);
+static void start_round(void);
+
+static int send_chat(int fd, const char *text)
 {
     message_t msg;
     memset(&msg, 0, sizeof(msg));
@@ -60,19 +72,24 @@ static void send_chat(int fd, const char *text)
     if (msg.length > MAX_PAYLOAD)
         msg.length = MAX_PAYLOAD;
     memcpy(msg.payload, text, msg.length);
-    send_message(fd, &msg);
+    return send_message(fd, &msg);
 }
 
 static void broadcast_chat(const char *text)
 {
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (clients[i].fd != -1)
-            send_chat(clients[i].fd, text);
-    }
-}
+    int failed[MAX_PLAYERS];
+    int nfailed = 0;
 
-static void remove_client(int slot);
-static void start_round(void);
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (clients[i].fd != -1) {
+            if (send_chat(clients[i].fd, text) < 0)
+                failed[nfailed++] = i;
+        }
+    }
+
+    for (int i = 0; i < nfailed; i++)
+        remove_client(failed[i]);
+}
 
 static void broadcast_to_clients(const message_t *msg, int skip_slot)
 {
@@ -140,10 +157,23 @@ static void end_round(const char *reason)
 {
     game->round_active = 0;
 
-    /* Artist points are awarded incrementally during the round,
-     * so no end-of-round artist scoring needed. */
+    /* Send structured MSG_ROUND_END so clients can reset state */
+    {
+        message_t re;
+        memset(&re, 0, sizeof(re));
+        re.msg_type = MSG_ROUND_END;
+        uint32_t net_rn = htonl(game->round_num);
+        uint32_t word_len = (uint32_t)strlen(game->secret_word);
+        uint32_t net_wl = htonl(word_len);
+        memcpy(re.payload, &net_rn, sizeof(net_rn));
+        memcpy(re.payload + sizeof(net_rn), &net_wl, sizeof(net_wl));
+        memcpy(re.payload + 2 * sizeof(uint32_t), game->secret_word,
+               word_len);
+        re.length = 2 * sizeof(uint32_t) + word_len;
+        broadcast_to_clients(&re, -1);
+    }
 
-    /* Build round scoreboard */
+    /* Build human-readable round scoreboard */
     char buf[MAX_PAYLOAD];
     int pos = snprintf(buf, sizeof(buf),
         "\n=== Round %u/%u Over (%s) ===\nThe word was: %s\n\nScoreboard:\n",
@@ -273,13 +303,32 @@ static void remove_client(int slot)
     printf("Removing client \"%s\" (slot %d, fd %d)\n",
            clients[slot].name, slot, clients[slot].fd);
 
+    close(clients[slot].fd);
+    clients[slot].fd = -1;
+
     if (clients[slot].active) {
         game_remove_player(game, (uint32_t)slot);
 
+        int remaining = 0;
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            if (i != slot && clients[i].fd != -1 && clients[i].active)
+                remaining++;
+        }
+
+        /* Send structured MSG_PLAYER_DISCONNECT to remaining clients */
+        message_t disc;
+        memset(&disc, 0, sizeof(disc));
+        disc.msg_type = MSG_PLAYER_DISCONNECT;
+        uint32_t net_id = htonl((uint32_t)slot);
+        uint32_t net_rem = htonl((uint32_t)remaining);
+        memcpy(disc.payload, &net_id, sizeof(net_id));
+        memcpy(disc.payload + sizeof(net_id), &net_rem, sizeof(net_rem));
+        disc.length = sizeof(net_id) + sizeof(net_rem);
+        broadcast_to_clients(&disc, slot);
+
         char buf[128];
-        snprintf(buf, sizeof(buf), "%s has disconnected.\n", clients[slot].name);
-        close(clients[slot].fd);
-        clients[slot].fd = -1;
+        snprintf(buf, sizeof(buf), "%s has disconnected.\n",
+                 clients[slot].name);
         clients[slot].active = 0;
         clients[slot].name[0] = '\0';
         broadcast_chat(buf);
@@ -292,8 +341,6 @@ static void remove_client(int slot)
             }
         }
     } else {
-        close(clients[slot].fd);
-        clients[slot].fd = -1;
         clients[slot].active = 0;
         clients[slot].name[0] = '\0';
     }
@@ -440,7 +487,21 @@ static void handle_guess(int slot, const message_t *msg)
         memcpy(notify.payload, nbuf, notify.length);
         send_message(clients[slot].fd, &notify);
 
-        /* Broadcast to everyone */
+        /* Send structured MSG_CORRECT_GUESS to all clients */
+        message_t cg;
+        memset(&cg, 0, sizeof(cg));
+        cg.msg_type = MSG_CORRECT_GUESS;
+        uint32_t net_gid = htonl((uint32_t)slot);
+        uint32_t net_gpts = htonl(guesser_pts);
+        uint32_t net_apts = htonl(artist_pts);
+        memcpy(cg.payload, &net_gid, sizeof(net_gid));
+        memcpy(cg.payload + sizeof(net_gid), &net_gpts, sizeof(net_gpts));
+        memcpy(cg.payload + sizeof(net_gid) + sizeof(net_gpts),
+               &net_apts, sizeof(net_apts));
+        cg.length = 3 * sizeof(uint32_t);
+        broadcast_to_clients(&cg, -1);
+
+        /* Human-readable broadcast */
         char buf[MAX_PAYLOAD];
         snprintf(buf, sizeof(buf), "%s guessed the word! (+%u pts)\n",
                  clients[slot].name, guesser_pts);
@@ -600,9 +661,16 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+
     printf("Server listening on port %d\n", port);
 
-    while (1) {
+    while (!got_sigint) {
         fd_set readfds;
         int maxfd = build_fdset(&readfds);
 
@@ -643,11 +711,13 @@ int main(int argc, char *argv[])
         }
     }
 
+    printf("\nShutting down server...\n");
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (clients[i].fd != -1)
             close(clients[i].fd);
     }
-    close(listen_fd);
+    if (listen_fd >= 0)
+        close(listen_fd);
     game_cleanup(game);
     return 0;
 }
