@@ -148,8 +148,12 @@ static void test_scoring(void)
     g->num_guessed = 10;
     ASSERT(game_get_guesser_points(g) == 5, "many guessers still get 5 (min)");
 
-    ASSERT(game_get_artist_points(g, 1) == 5, "artist gets 5 if guessed");
-    ASSERT(game_get_artist_points(g, 0) == 0, "artist gets 0 if not guessed");
+    g->num_guessed = 0;
+    ASSERT(game_get_artist_points_for_guess(g) == 5,
+           "artist gets 5 for first correct guess");
+    g->num_guessed = 1;
+    ASSERT(game_get_artist_points_for_guess(g) == 1,
+           "artist gets 1 for subsequent correct guesses");
 
     game_cleanup(g);
 }
