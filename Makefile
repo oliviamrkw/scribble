@@ -8,7 +8,7 @@ server: server.o net.o game.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 client: client.o net.o
-	$(CC) $(CFLAGS) -o $@ $^ -lncurses
+	$(CC) $(CFLAGS) -o $@ $^ -lX11
 
 server.o: server.c net.h game.h
 	$(CC) $(CFLAGS) -c $<

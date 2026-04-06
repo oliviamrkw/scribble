@@ -232,9 +232,7 @@ static void start_round(void)
             snprintf(text, sizeof(text),
                 "\n=== Round %u/%u ===\n"
                 "You are the DRAWER! The word is: %.*s\n"
-                "Hint shown to guessers: %.*s\n"
-                "Use arrow keys to move, Space to draw, C for color, Z to clear\n"
-                "Press Tab to switch to chat mode (60 seconds)\n",
+                "Hint shown to guessers: %.*s\n",
                 game->round_num, game->total_rounds,
                 MAX_NAME_LEN, game->secret_word,
                 MAX_NAME_LEN * 2, hint);
@@ -434,7 +432,7 @@ static void handle_guess(int slot, const message_t *msg)
         return;
     }
 
-    if (game_validate_guess(game, guess)) {
+    if (strcasecmp(guess, game->secret_word) == 0) {
         uint32_t guesser_pts = game_get_guesser_points(game);
         uint32_t artist_pts = game_get_artist_points_for_guess(game);
         player->score += guesser_pts;

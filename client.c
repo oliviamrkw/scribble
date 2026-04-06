@@ -1,12 +1,11 @@
 /*
- * client.c — ncurses terminal client for Scribble
+ * client.c — X11 GUI client for Scribble
  *
  * Usage: ./client <host> <port>
  *
- * Connects to the server, sends a PLAYER_JOIN message, then enters an
- * ncurses UI with a drawing canvas (left), chat pane (right), status bar,
- * and input line.  Uses select() on stdin and the server socket for
- * concurrent I/O.
+ * Opens a graphical window with a drawing canvas and chat panel.
+ * The artist draws with the mouse; guessers type guesses.
+ * Uses select() on the X11 connection fd and the server socket.
  */
 #define _POSIX_C_SOURCE 200112L
 #include <stdio.h>
@@ -20,188 +19,93 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <netdb.h>
-#include <curses.h>
+#include <signal.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
 #include "net.h"
 
-/* Layout constants — the canvas takes 2 columns per cell to look square */
-#define CANVAS_DISPLAY_W (CANVAS_COLS * 2)
-#define CHAT_MIN_W       24
-#define STATUS_H         1
-#define INPUT_H          1
+/* ------------------------------------------------------------------ */
+/* Layout constants                                                    */
+/* ------------------------------------------------------------------ */
+#define CELL_SIZE    16          /* pixels per canvas cell */
+#define CANVAS_PX_W  (CANVAS_COLS * CELL_SIZE)  /* 640 */
+#define CANVAS_PX_H  (CANVAS_ROWS * CELL_SIZE)  /* 320 */
+#define CHAT_W       300        /* chat panel width */
+#define TOOLBAR_H    40         /* color palette bar height */
+#define INPUT_H      28         /* text input bar height */
+#define WIN_W        (CANVAS_PX_W + CHAT_W)
+#define WIN_H        (CANVAS_PX_H + TOOLBAR_H + INPUT_H)
+#define CHAT_LINE_H  16         /* pixels per chat line */
 
-/* Chat line buffer */
+/* Chat buffer */
 #define MAX_CHAT_LINES 200
 #define MAX_LINE_LEN   256
 
-/* Color names for the status bar */
-static const char *color_names[NUM_COLORS] = {
-    "BLACK", "RED", "GREEN", "YELLOW", "BLUE", "MAGENTA", "CYAN", "WHITE"
+/* ------------------------------------------------------------------ */
+/* Globals                                                             */
+/* ------------------------------------------------------------------ */
+
+/* X11 */
+static Display *dpy = NULL;
+static Window   win;
+static GC       gc;
+static Atom     wm_delete;
+static XFontStruct *font = NULL;
+
+/* Drawing palette — RGB values for the 8 colors */
+static unsigned long xcolors[NUM_COLORS];
+static const char *color_hex[NUM_COLORS] = {
+    "#000000", "#FF0000", "#00CC00", "#DDDD00",
+    "#0000FF", "#CC00CC", "#00CCCC", "#FFFFFF"
 };
 
-/* Client state */
+/* Network */
 static int sockfd = -1;
+
+/* Game state */
 static int is_artist = 0;
 static int has_guessed = 0;
 static uint8_t canvas[CANVAS_ROWS][CANVAS_COLS];
-static int cursor_row = 0, cursor_col = 0;
-static int current_color = 1;  /* 1-7; 0 is eraser */
-static int draw_mode = 1;      /* 1 = drawing mode (artist), 0 = chat input */
+static int current_color = 1;
+static int mouse_held = 0;     /* left button held for drag-drawing */
 
-static char input_buf[MAX_PAYLOAD];
-static int input_len = 0;
-
+/* Chat */
 static char chat_lines[MAX_CHAT_LINES][MAX_LINE_LEN];
 static int chat_count = 0;
 
-/* ncurses windows */
-static WINDOW *canvas_win = NULL;
-static WINDOW *chat_win = NULL;
-static WINDOW *status_win = NULL;
-static WINDOW *input_win = NULL;
-
-static int chat_w = 0;  /* computed at startup */
+/* Text input */
+static char input_buf[MAX_PAYLOAD];
+static int input_len = 0;
 
 /* ------------------------------------------------------------------ */
-/* Helpers                                                             */
+/* Chat helpers                                                        */
 /* ------------------------------------------------------------------ */
 
 static void add_chat_line(const char *text)
 {
-    /* Split text on newlines and add each line separately */
     const char *p = text;
     while (*p) {
         const char *nl = strchr(p, '\n');
-        int len;
-        if (nl) {
-            len = (int)(nl - p);
-        } else {
-            len = (int)strlen(p);
-        }
+        int len = nl ? (int)(nl - p) : (int)strlen(p);
 
         if (len > 0) {
             if (chat_count < MAX_CHAT_LINES) {
                 snprintf(chat_lines[chat_count], MAX_LINE_LEN, "%.*s", len, p);
                 chat_count++;
             } else {
-                /* Shift up */
                 memmove(chat_lines[0], chat_lines[1],
                         (MAX_CHAT_LINES - 1) * MAX_LINE_LEN);
                 snprintf(chat_lines[MAX_CHAT_LINES - 1], MAX_LINE_LEN,
                          "%.*s", len, p);
             }
         }
-
-        if (nl)
-            p = nl + 1;
-        else
-            break;
+        p = nl ? nl + 1 : p + strlen(p);
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* Drawing the UI                                                      */
-/* ------------------------------------------------------------------ */
-
-static void draw_canvas(void)
-{
-    werase(canvas_win);
-    box(canvas_win, 0, 0);
-
-    for (int r = 0; r < CANVAS_ROWS; r++) {
-        for (int c = 0; c < CANVAS_COLS; c++) {
-            int pair = canvas[r][c] + 1;
-            wattron(canvas_win, COLOR_PAIR(pair));
-            mvwaddstr(canvas_win, r + 1, c * 2 + 1, "  ");
-            wattroff(canvas_win, COLOR_PAIR(pair));
-        }
-    }
-
-    /* Draw cursor for the artist */
-    if (is_artist) {
-        wattron(canvas_win, A_REVERSE | A_BOLD);
-        mvwaddstr(canvas_win, cursor_row + 1, cursor_col * 2 + 1, "[]");
-        wattroff(canvas_win, A_REVERSE | A_BOLD);
-    }
-
-    wrefresh(canvas_win);
-}
-
-static void draw_chat(void)
-{
-    werase(chat_win);
-    box(chat_win, 0, 0);
-    mvwaddstr(chat_win, 0, 2, " Chat ");
-
-    int inner_h = CANVAS_ROWS;  /* rows available inside the box */
-    int start = 0;
-    if (chat_count > inner_h)
-        start = chat_count - inner_h;
-
-    for (int i = start, row = 1; i < chat_count && row <= inner_h; i++, row++) {
-        mvwaddnstr(chat_win, row, 1, chat_lines[i], chat_w - 2);
-    }
-
-    wrefresh(chat_win);
-}
-
-static void draw_status(void)
-{
-    werase(status_win);
-    wattron(status_win, A_REVERSE);
-
-    /* Fill the bar */
-    int w = CANVAS_DISPLAY_W + 2 + chat_w + 2;
-    for (int i = 0; i < w; i++)
-        mvwaddch(status_win, 0, i, ' ');
-
-    if (is_artist) {
-        /* Show color swatch */
-        mvwprintw(status_win, 0, 1, " DRAWER ");
-        wattroff(status_win, A_REVERSE);
-
-        mvwprintw(status_win, 0, 10, "Color: ");
-        wattron(status_win, COLOR_PAIR(current_color + 1));
-        waddstr(status_win, "  ");
-        wattroff(status_win, COLOR_PAIR(current_color + 1));
-        wprintw(status_win, " %s", color_names[current_color]);
-
-        mvwprintw(status_win, 0, 35, "| Click=draw RClick=erase C=color Z=clear Tab=chat");
-    } else {
-        if (has_guessed) {
-            mvwprintw(status_win, 0, 1, " GUESSED! Waiting for round to end... ");
-        } else {
-            mvwprintw(status_win, 0, 1, " GUESSER | Type your guess and press Enter ");
-        }
-        wattroff(status_win, A_REVERSE);
-    }
-
-    wattroff(status_win, A_REVERSE);
-    wrefresh(status_win);
-}
-
-static void draw_input(void)
-{
-    werase(input_win);
-
-    if (is_artist && draw_mode) {
-        mvwprintw(input_win, 0, 0, "[DRAW MODE] Press Tab to type a message");
-    } else {
-        mvwprintw(input_win, 0, 0, "> %.*s", input_len, input_buf);
-    }
-
-    wrefresh(input_win);
-}
-
-static void refresh_ui(void)
-{
-    draw_canvas();
-    draw_chat();
-    draw_status();
-    draw_input();
-}
-
-/* ------------------------------------------------------------------ */
-/* Network                                                             */
+/* Network helpers                                                     */
 /* ------------------------------------------------------------------ */
 
 static int send_player_join(const char *name)
@@ -251,49 +155,38 @@ static int send_draw_clear(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* Handling server messages                                            */
+/* Handle server messages                                              */
 /* ------------------------------------------------------------------ */
 
-static int handle_server_message(const message_t *msg)
+static void handle_server_message(const message_t *msg)
 {
     switch (msg->msg_type) {
     case MSG_ROUND_START: {
-        if (msg->length < 2)
-            break;
+        if (msg->length < 2) break;
         is_artist = msg->payload[0];
         has_guessed = 0;
         memset(canvas, 0, sizeof(canvas));
-        cursor_row = 0;
-        cursor_col = 0;
-
-        /* Artists start in draw mode, guessers in chat mode */
-        draw_mode = is_artist ? 1 : 0;
 
         uint32_t tlen = msg->length - 1;
-        if (tlen > MAX_PAYLOAD - 1)
-            tlen = MAX_PAYLOAD - 1;
+        if (tlen > MAX_PAYLOAD - 1) tlen = MAX_PAYLOAD - 1;
         char text[MAX_PAYLOAD];
         memcpy(text, msg->payload + 1, tlen);
         text[tlen] = '\0';
         add_chat_line(text);
         break;
     }
-
     case MSG_CHAT: {
         uint32_t len = msg->length;
-        if (len > MAX_PAYLOAD - 1)
-            len = MAX_PAYLOAD - 1;
+        if (len > MAX_PAYLOAD - 1) len = MAX_PAYLOAD - 1;
         char buf[MAX_PAYLOAD];
         memcpy(buf, msg->payload, len);
         buf[len] = '\0';
         add_chat_line(buf);
         break;
     }
-
     case MSG_GUESSED_NOTIFY: {
         uint32_t len = msg->length;
-        if (len > MAX_PAYLOAD - 1)
-            len = MAX_PAYLOAD - 1;
+        if (len > MAX_PAYLOAD - 1) len = MAX_PAYLOAD - 1;
         char buf[MAX_PAYLOAD];
         memcpy(buf, msg->payload, len);
         buf[len] = '\0';
@@ -301,236 +194,398 @@ static int handle_server_message(const message_t *msg)
         add_chat_line(buf);
         break;
     }
-
     case MSG_DRAW_CELL: {
-        if (msg->length < 3)
-            break;
-        uint8_t row = msg->payload[0];
-        uint8_t col = msg->payload[1];
-        uint8_t color = msg->payload[2];
-        if (row < CANVAS_ROWS && col < CANVAS_COLS && color < NUM_COLORS)
-            canvas[row][col] = color;
+        if (msg->length < 3) break;
+        uint8_t r = msg->payload[0];
+        uint8_t c = msg->payload[1];
+        uint8_t col = msg->payload[2];
+        if (r < CANVAS_ROWS && c < CANVAS_COLS && col < NUM_COLORS)
+            canvas[r][c] = col;
         break;
     }
-
     case MSG_DRAW_CLEAR:
         memset(canvas, 0, sizeof(canvas));
         break;
-
     case MSG_CANVAS_SYNC:
         if (msg->length >= CANVAS_ROWS * CANVAS_COLS)
             memcpy(canvas, msg->payload, CANVAS_ROWS * CANVAS_COLS);
         break;
-
     case MSG_CORRECT_GUESS:
     case MSG_ROUND_END:
         is_artist = 0;
         has_guessed = 0;
         break;
-
     default:
         break;
     }
-
-    return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* Key handling                                                        */
+/* Drawing the UI                                                      */
 /* ------------------------------------------------------------------ */
 
-/*
- * Returns -1 to signal quit, 0 otherwise.
- */
-/*
- * Try to paint the canvas cell at screen coordinates (mouse_y, mouse_x).
- * Returns 1 if the click was on the canvas, 0 otherwise.
- */
-static int try_paint_canvas(int mouse_y, int mouse_x, uint8_t color)
+static void paint_cell(int r, int c)
 {
-    if (!is_artist)
-        return 0;
+    XSetForeground(dpy, gc, xcolors[(int)canvas[r][c]]);
+    XFillRectangle(dpy, win, gc, c * CELL_SIZE, r * CELL_SIZE,
+                   CELL_SIZE, CELL_SIZE);
 
-    /* Canvas window starts at (0,0); cells start at (1,1) inside the box.
-     * Each cell is 2 columns wide. */
-    int row = mouse_y - 1;          /* subtract box top border */
-    int col = (mouse_x - 1) / 2;   /* subtract box left border, 2 cols per cell */
+    /* Grid lines */
+    XSetForeground(dpy, gc, xcolors[0]);
+    XDrawRectangle(dpy, win, gc, c * CELL_SIZE, r * CELL_SIZE,
+                   CELL_SIZE - 1, CELL_SIZE - 1);
+}
 
-    if (row < 0 || row >= CANVAS_ROWS || col < 0 || col >= CANVAS_COLS)
-        return 0;
+static void redraw_all(void)
+{
+    /* Background */
+    XSetForeground(dpy, gc, WhitePixel(dpy, DefaultScreen(dpy)));
+    XFillRectangle(dpy, win, gc, 0, 0, WIN_W, WIN_H);
+
+    /* ---- Canvas ---- */
+    for (int r = 0; r < CANVAS_ROWS; r++)
+        for (int c = 0; c < CANVAS_COLS; c++)
+            paint_cell(r, c);
+
+    /* Canvas border */
+    XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+    XDrawRectangle(dpy, win, gc, 0, 0, CANVAS_PX_W - 1, CANVAS_PX_H - 1);
+
+    /* ---- Toolbar (below canvas) ---- */
+    int ty = CANVAS_PX_H;
+
+    /* Divider line */
+    XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+    XDrawLine(dpy, win, gc, 0, ty, WIN_W, ty);
+
+    /* Color palette swatches */
+    int swatch_size = 24;
+    int pad = 6;
+    for (int i = 0; i < NUM_COLORS; i++) {
+        int sx = pad + i * (swatch_size + pad);
+        int sy = ty + (TOOLBAR_H - swatch_size) / 2;
+        XSetForeground(dpy, gc, xcolors[i]);
+        XFillRectangle(dpy, win, gc, sx, sy, swatch_size, swatch_size);
+        /* Highlight selected color */
+        if (i == current_color) {
+            XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+            XSetLineAttributes(dpy, gc, 3, LineSolid, CapButt, JoinMiter);
+            XDrawRectangle(dpy, win, gc, sx - 2, sy - 2,
+                           swatch_size + 3, swatch_size + 3);
+            XSetLineAttributes(dpy, gc, 1, LineSolid, CapButt, JoinMiter);
+        } else {
+            XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+            XDrawRectangle(dpy, win, gc, sx, sy,
+                           swatch_size - 1, swatch_size - 1);
+        }
+    }
+
+    /* Clear button */
+    int clr_x = pad + NUM_COLORS * (swatch_size + pad) + 20;
+    int clr_y = ty + (TOOLBAR_H - swatch_size) / 2;
+    XSetForeground(dpy, gc, 0xDDDDDD);
+    XFillRectangle(dpy, win, gc, clr_x, clr_y, 60, swatch_size);
+    XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+    XDrawRectangle(dpy, win, gc, clr_x, clr_y, 59, swatch_size - 1);
+    if (font) {
+        XDrawString(dpy, win, gc, clr_x + 10, clr_y + 17, "Clear", 5);
+    }
+
+    /* Role label */
+    int label_x = clr_x + 80;
+    if (is_artist) {
+        XSetForeground(dpy, gc, 0x0000CC);
+        if (font) XDrawString(dpy, win, gc, label_x, ty + 25,
+                              "DRAWER", 6);
+    } else {
+        XSetForeground(dpy, gc, 0x008800);
+        const char *lbl = has_guessed ? "GUESSED!" : "GUESSER";
+        if (font) XDrawString(dpy, win, gc, label_x, ty + 25,
+                              lbl, (int)strlen(lbl));
+    }
+
+    /* ---- Chat panel (right side) ---- */
+    int cx = CANVAS_PX_W;
+
+    /* Vertical divider */
+    XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+    XDrawLine(dpy, win, gc, cx, 0, cx, CANVAS_PX_H);
+
+    /* Chat header */
+    XSetForeground(dpy, gc, 0xEEEEEE);
+    XFillRectangle(dpy, win, gc, cx + 1, 0, CHAT_W - 1, 20);
+    XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+    XDrawLine(dpy, win, gc, cx, 20, cx + CHAT_W, 20);
+    if (font) XDrawString(dpy, win, gc, cx + 8, 15, "Chat", 4);
+
+    /* Chat lines */
+    int visible = (CANVAS_PX_H - 22) / CHAT_LINE_H;
+    int start = 0;
+    if (chat_count > visible)
+        start = chat_count - visible;
+
+    XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+    for (int i = start, row = 0; i < chat_count && row < visible; i++, row++) {
+        int ty2 = 22 + CHAT_LINE_H + row * CHAT_LINE_H;
+        int char_w = font ? font->max_bounds.width : 6;
+        int maxchars = (CHAT_W - 12) / char_w;
+        int len = (int)strlen(chat_lines[i]);
+        if (len > maxchars) len = maxchars;
+        if (font) XDrawString(dpy, win, gc, cx + 6, ty2,
+                              chat_lines[i], len);
+    }
+
+    /* ---- Input bar (bottom) ---- */
+    int iy = CANVAS_PX_H + TOOLBAR_H;
+    XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+    XDrawLine(dpy, win, gc, 0, iy, WIN_W, iy);
+
+    XSetForeground(dpy, gc, 0xF5F5F5);
+    XFillRectangle(dpy, win, gc, 0, iy + 1, WIN_W, INPUT_H - 1);
+
+    XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+    if (font) {
+        char prompt[MAX_PAYLOAD + 4];
+        snprintf(prompt, sizeof(prompt), "> %.*s_", input_len, input_buf);
+        XDrawString(dpy, win, gc, 8, iy + 19, prompt, (int)strlen(prompt));
+    }
+
+    XFlush(dpy);
+}
+
+/* ------------------------------------------------------------------ */
+/* Canvas mouse interaction                                            */
+/* ------------------------------------------------------------------ */
+
+static void try_paint(int px, int py, uint8_t color)
+{
+    if (!is_artist) return;
+    if (px < 0 || px >= CANVAS_PX_W || py < 0 || py >= CANVAS_PX_H)
+        return;
+
+    int col = px / CELL_SIZE;
+    int row = py / CELL_SIZE;
+    if (row >= CANVAS_ROWS || col >= CANVAS_COLS) return;
+
+    if (canvas[row][col] == color) return;  /* no change */
 
     canvas[row][col] = color;
-    cursor_row = row;
-    cursor_col = col;
     send_draw_cell((uint8_t)row, (uint8_t)col, color);
-    return 1;
+
+    /* Immediate visual feedback — repaint just this cell */
+    paint_cell(row, col);
+    XFlush(dpy);
 }
 
-static int handle_keypress(int ch)
+/* Check if a click is on a toolbar color swatch; returns color index or -1 */
+static int toolbar_hit_color(int px, int py)
 {
-    /* Mouse events — artist can click/drag to draw on the canvas */
-    if (ch == KEY_MOUSE) {
-        MEVENT event;
-        if (getmouse(&event) == OK && is_artist) {
-            /*
-             * Button masks vary across ncurses versions.  For drag
-             * (motion while held), some report REPORT_MOUSE_POSITION
-             * with no button bits.  We treat ANY mouse event whose
-             * coordinates fall on the canvas as a paint action, unless
-             * it is a button-3 (right-click) event which erases.
-             */
-            int is_erase = (event.bstate & (BUTTON3_PRESSED | BUTTON3_CLICKED));
-            int is_release = (event.bstate & (BUTTON1_RELEASED | BUTTON3_RELEASED));
+    int ty = CANVAS_PX_H;
+    int swatch_size = 24;
+    int pad = 6;
 
-            if (!is_release) {
-                uint8_t color = is_erase ? 0 : (uint8_t)current_color;
-                try_paint_canvas(event.y, event.x, color);
+    for (int i = 0; i < NUM_COLORS; i++) {
+        int sx = pad + i * (swatch_size + pad);
+        int sy = ty + (TOOLBAR_H - swatch_size) / 2;
+        if (px >= sx && px < sx + swatch_size &&
+            py >= sy && py < sy + swatch_size)
+            return i;
+    }
+    return -1;
+}
+
+/* Check if a click is on the Clear button */
+static int toolbar_hit_clear(int px, int py)
+{
+    int ty = CANVAS_PX_H;
+    int swatch_size = 24;
+    int pad = 6;
+    int clr_x = pad + NUM_COLORS * (swatch_size + pad) + 20;
+    int clr_y = ty + (TOOLBAR_H - swatch_size) / 2;
+    return (px >= clr_x && px < clr_x + 60 &&
+            py >= clr_y && py < clr_y + swatch_size);
+}
+
+/* ------------------------------------------------------------------ */
+/* X11 event handling                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Returns -1 to quit, 0 otherwise.
+ */
+static int handle_x11_events(void)
+{
+    while (XPending(dpy)) {
+        XEvent ev;
+        XNextEvent(dpy, &ev);
+
+        switch (ev.type) {
+        case Expose:
+            if (ev.xexpose.count == 0)
+                redraw_all();
+            break;
+
+        case ButtonPress: {
+            int px = ev.xbutton.x;
+            int py = ev.xbutton.y;
+
+            if (ev.xbutton.button == 1) {
+                /* Check toolbar first */
+                int ci = toolbar_hit_color(px, py);
+                if (ci >= 0 && is_artist) {
+                    current_color = ci;
+                    redraw_all();
+                    break;
+                }
+                if (toolbar_hit_clear(px, py) && is_artist) {
+                    memset(canvas, 0, sizeof(canvas));
+                    send_draw_clear();
+                    redraw_all();
+                    break;
+                }
+
+                /* Canvas drawing */
+                mouse_held = 1;
+                try_paint(px, py, (uint8_t)current_color);
+            } else if (ev.xbutton.button == 3) {
+                /* Right click = erase */
+                try_paint(px, py, 0);
             }
+            break;
         }
-        return 0;
-    }
 
-    /* Tab toggles between draw mode and chat mode */
-    if (ch == '\t') {
-        if (is_artist) {
-            draw_mode = !draw_mode;
+        case ButtonRelease:
+            if (ev.xbutton.button == 1)
+                mouse_held = 0;
+            break;
+
+        case MotionNotify:
+            /* Drag drawing */
+            if (mouse_held && is_artist) {
+                /* Drain extra motion events for responsiveness */
+                while (XCheckMaskEvent(dpy, PointerMotionMask, &ev))
+                    ;
+                try_paint(ev.xmotion.x, ev.xmotion.y,
+                          (uint8_t)current_color);
+            }
+            break;
+
+        case KeyPress: {
+            char buf[32];
+            KeySym ksym;
+            int n = XLookupString(&ev.xkey, buf, sizeof(buf) - 1,
+                                  &ksym, NULL);
+
+            if (ksym == XK_Return || ksym == XK_KP_Enter) {
+                if (input_len > 0) {
+                    send_guess(input_buf, (uint32_t)input_len);
+                    input_len = 0;
+                    input_buf[0] = '\0';
+                    redraw_all();
+                }
+            } else if (ksym == XK_BackSpace) {
+                if (input_len > 0) {
+                    input_buf[--input_len] = '\0';
+                    redraw_all();
+                }
+            } else if (ksym == XK_Escape) {
+                return -1;
+            } else if (n > 0 && buf[0] >= 32 && buf[0] < 127) {
+                if (input_len < (int)sizeof(input_buf) - 1) {
+                    input_buf[input_len++] = buf[0];
+                    input_buf[input_len] = '\0';
+                    redraw_all();
+                }
+            }
+            break;
         }
-        return 0;
-    }
 
-    /* In draw mode (artist only) */
-    if (draw_mode && is_artist) {
-        switch (ch) {
-        case KEY_UP:
-            if (cursor_row > 0) cursor_row--;
+        case ClientMessage:
+            if ((Atom)ev.xclient.data.l[0] == wm_delete)
+                return -1;
             break;
-        case KEY_DOWN:
-            if (cursor_row < CANVAS_ROWS - 1) cursor_row++;
-            break;
-        case KEY_LEFT:
-            if (cursor_col > 0) cursor_col--;
-            break;
-        case KEY_RIGHT:
-            if (cursor_col < CANVAS_COLS - 1) cursor_col++;
-            break;
-        case ' ':
-            canvas[cursor_row][cursor_col] = (uint8_t)current_color;
-            send_draw_cell((uint8_t)cursor_row, (uint8_t)cursor_col,
-                           (uint8_t)current_color);
-            break;
-        case 'e':
-        case 'E':
-            canvas[cursor_row][cursor_col] = 0;
-            send_draw_cell((uint8_t)cursor_row, (uint8_t)cursor_col, 0);
-            break;
-        case 'c':
-            current_color = (current_color % (NUM_COLORS - 1)) + 1;
-            break;
-        case 'C':
-            current_color--;
-            if (current_color < 1) current_color = NUM_COLORS - 1;
-            break;
-        case 'z':
-        case 'Z':
-            memset(canvas, 0, sizeof(canvas));
-            send_draw_clear();
-            break;
+
         default:
             break;
         }
-        return 0;
     }
-
-    /* Chat / input mode */
-    switch (ch) {
-    case '\n':
-    case KEY_ENTER:
-        if (input_len > 0) {
-            send_guess(input_buf, (uint32_t)input_len);
-            input_len = 0;
-            input_buf[0] = '\0';
-        }
-        break;
-    case KEY_BACKSPACE:
-    case 127:
-    case 8:
-        if (input_len > 0)
-            input_buf[--input_len] = '\0';
-        break;
-    default:
-        if (ch >= 32 && ch < 127 && input_len < (int)sizeof(input_buf) - 1) {
-            input_buf[input_len++] = (char)ch;
-            input_buf[input_len] = '\0';
-        }
-        break;
-    }
-
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* ncurses setup / teardown                                            */
+/* X11 setup                                                           */
 /* ------------------------------------------------------------------ */
 
-static void setup_ncurses(void)
+static int setup_x11(void)
 {
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    set_escdelay(25);
-
-    /* Enable mouse clicks and drag events */
-    mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
-    mouseinterval(0);  /* disable click-vs-doubleclick delay */
-    /* Request button-event tracking (motion while button held) from terminal */
-    printf("\033[?1002h");
-    fflush(stdout);
-
-    if (has_colors()) {
-        start_color();
-        /* Color pairs: pair N+1 = background color N
-         * Pair 1 = black bg (empty), pair 2 = red bg, ... pair 8 = white bg */
-        init_pair(1, COLOR_WHITE, COLOR_BLACK);
-        init_pair(2, COLOR_WHITE, COLOR_RED);
-        init_pair(3, COLOR_WHITE, COLOR_GREEN);
-        init_pair(4, COLOR_BLACK, COLOR_YELLOW);
-        init_pair(5, COLOR_WHITE, COLOR_BLUE);
-        init_pair(6, COLOR_WHITE, COLOR_MAGENTA);
-        init_pair(7, COLOR_BLACK, COLOR_CYAN);
-        init_pair(8, COLOR_BLACK, COLOR_WHITE);
+    dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        fprintf(stderr, "Cannot open X display. Is DISPLAY set?\n");
+        return -1;
     }
 
-    int term_w = COLS;
-    chat_w = term_w - CANVAS_DISPLAY_W - 2;  /* subtract canvas box width */
-    if (chat_w < CHAT_MIN_W)
-        chat_w = CHAT_MIN_W;
+    int screen = DefaultScreen(dpy);
+    unsigned long black = BlackPixel(dpy, screen);
+    unsigned long white = WhitePixel(dpy, screen);
 
-    int canvas_win_w = CANVAS_DISPLAY_W + 2; /* +2 for box borders */
-    int canvas_win_h = CANVAS_ROWS + 2;
-    int chat_win_w = chat_w + 2;
+    win = XCreateSimpleWindow(dpy, RootWindow(dpy, screen),
+                              50, 50, WIN_W, WIN_H,
+                              1, black, white);
 
-    canvas_win = newwin(canvas_win_h, canvas_win_w, 0, 0);
-    chat_win   = newwin(canvas_win_h, chat_win_w, 0, canvas_win_w);
-    status_win = newwin(STATUS_H, term_w, canvas_win_h, 0);
-    input_win  = newwin(INPUT_H, term_w, canvas_win_h + STATUS_H, 0);
+    XStoreName(dpy, win, "Scribble");
 
-    refresh();
+    /* Subscribe to events */
+    XSelectInput(dpy, win,
+                 ExposureMask | KeyPressMask |
+                 ButtonPressMask | ButtonReleaseMask |
+                 PointerMotionMask);
+
+    /* Handle window close */
+    wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(dpy, win, &wm_delete, 1);
+
+    /* Prevent resizing */
+    XSizeHints *hints = XAllocSizeHints();
+    if (hints) {
+        hints->flags = PMinSize | PMaxSize;
+        hints->min_width = hints->max_width = WIN_W;
+        hints->min_height = hints->max_height = WIN_H;
+        XSetWMNormalHints(dpy, win, hints);
+        XFree(hints);
+    }
+
+    gc = XCreateGC(dpy, win, 0, NULL);
+
+    /* Load a basic fixed-width font */
+    font = XLoadQueryFont(dpy, "fixed");
+    if (!font)
+        font = XLoadQueryFont(dpy, "*-fixed-medium-r-*-*-13-*");
+    if (font)
+        XSetFont(dpy, gc, font->fid);
+
+    /* Allocate colors */
+    Colormap cmap = DefaultColormap(dpy, screen);
+    for (int i = 0; i < NUM_COLORS; i++) {
+        XColor xc;
+        XParseColor(dpy, cmap, color_hex[i], &xc);
+        XAllocColor(dpy, cmap, &xc);
+        xcolors[i] = xc.pixel;
+    }
+
+    XMapWindow(dpy, win);
+    XFlush(dpy);
+
+    return 0;
 }
 
-static void cleanup_ncurses(void)
+static void cleanup_x11(void)
 {
-    /* Disable mouse motion tracking */
-    printf("\033[?1002l");
-    fflush(stdout);
-
-    if (canvas_win) delwin(canvas_win);
-    if (chat_win) delwin(chat_win);
-    if (status_win) delwin(status_win);
-    if (input_win) delwin(input_win);
-    endwin();
+    if (font) XFreeFont(dpy, font);
+    if (gc) XFreeGC(dpy, gc);
+    if (dpy) {
+        XDestroyWindow(dpy, win);
+        XCloseDisplay(dpy);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -552,7 +607,9 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    /* Resolve host and connect (before ncurses) */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Resolve and connect */
     struct addrinfo hints, *result, *rp;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -570,10 +627,8 @@ int main(int argc, char *argv[])
     int sock = -1;
     for (rp = result; rp != NULL; rp = rp->ai_next) {
         sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sock < 0)
-            continue;
-        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0)
-            break;
+        if (sock < 0) continue;
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) break;
         close(sock);
         sock = -1;
     }
@@ -587,7 +642,7 @@ int main(int argc, char *argv[])
     sockfd = sock;
     printf("Connected to %s:%d\n", host, port);
 
-    /* Get player name (regular stdio, before ncurses) */
+    /* Get player name (stdio, before X11) */
     char name[MAX_NAME_LEN];
     printf("Enter your name: ");
     fflush(stdout);
@@ -616,63 +671,61 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Enter ncurses mode */
-    setup_ncurses();
+    /* Open X11 window */
+    if (setup_x11() < 0) {
+        close(sockfd);
+        return 1;
+    }
 
     add_chat_line("Connected! Type \"play\" to start.");
-    add_chat_line("(Press Tab to switch draw/chat mode)");
-    refresh_ui();
+    memset(canvas, 0, sizeof(canvas));
 
-    /* Main loop: select() on stdin + server socket */
+    /* Main loop: select() on X11 fd + server socket */
+    int x11_fd = ConnectionNumber(dpy);
     int running = 1;
+
     while (running) {
         fd_set readfds;
         FD_ZERO(&readfds);
-        FD_SET(STDIN_FILENO, &readfds);
+        FD_SET(x11_fd, &readfds);
         FD_SET(sockfd, &readfds);
-        int maxfd = sockfd > STDIN_FILENO ? sockfd : STDIN_FILENO;
+        int maxfd = x11_fd > sockfd ? x11_fd : sockfd;
 
         struct timeval tv;
         tv.tv_sec = 0;
-        tv.tv_usec = 50000;  /* 50ms for responsive UI */
+        tv.tv_usec = 50000;  /* 50ms */
 
         int activity = select(maxfd + 1, &readfds, NULL, NULL, &tv);
         if (activity < 0) {
-            if (errno == EINTR)
-                continue;
+            if (errno == EINTR) continue;
             break;
         }
 
-        /* Handle keyboard input */
-        if (FD_ISSET(STDIN_FILENO, &readfds)) {
-            int ch;
-            while ((ch = getch()) != ERR) {
-                if (handle_keypress(ch) < 0) {
-                    running = 0;
-                    break;
-                }
+        /* X11 events */
+        if (FD_ISSET(x11_fd, &readfds) || XPending(dpy)) {
+            if (handle_x11_events() < 0) {
+                running = 0;
+                break;
             }
         }
 
-        /* Handle server messages */
+        /* Server messages */
         if (FD_ISSET(sockfd, &readfds)) {
             message_t msg;
             memset(&msg, 0, sizeof(msg));
             if (recv_message(sockfd, &msg) < 0) {
                 add_chat_line("*** Server disconnected ***");
-                refresh_ui();
-                napms(2000);
+                redraw_all();
+                sleep(2);
                 running = 0;
             } else {
                 handle_server_message(&msg);
+                redraw_all();
             }
         }
-
-        if (running)
-            refresh_ui();
     }
 
-    cleanup_ncurses();
+    cleanup_x11();
     close(sockfd);
     return 0;
 }

@@ -15,7 +15,10 @@
       "Bash(python3 -c ':*)",
       "Bash(printf '%s' 'dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-5AB9DC11E85A')",
       "Bash(pkill -9 -f \"./server\")",
-      "Bash(sudo apt:*)"
+      "Bash(sudo apt:*)",
+      "Bash(printf 'apple\\\\n')",
+      "Bash(xxd \"c:\\\\Users\\\\olivia\\\\Documents\\\\UofT\\\\CSC209\\\\scribble\\\\scribble\\\\words.txt\")",
+      "Bash(printf 'apple\\\\nbanana\\\\ncat\\\\ndog\\\\nelephant\\\\nfish\\\\nguitar\\\\nhouse\\\\nisland\\\\njungle\\\\nkite\\\\nlemon\\\\nmountain\\\\nnotebook\\\\nocean\\\\npiano\\\\nqueen\\\\nrainbow\\\\nsunflower\\\\ntree\\\\numbrella\\\\nviolin\\\\nwhale\\\\nbicycle\\\\ndragon\\\\nflower\\\\ngrape\\\\nhammer\\\\nigloo\\\\njellyfish\\\\nkangaroo\\\\nlighthouse\\\\nmushroom\\\\nnecklace\\\\noctopus\\\\npenguin\\\\nrocket\\\\nsnowflake\\\\ntornado\\\\nwaterfall\\\\n')"
     ]
   }
 }

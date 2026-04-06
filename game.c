@@ -6,6 +6,24 @@
 #include "game.h"
 
 /*
+ * Remove all characters that are not printable ASCII (letters, spaces, etc).
+ * Keeps only bytes 32-126. This eliminates \r, \n, and any other junk.
+ */
+static void clean_string(char *str)
+{
+    int j = 0;
+    for (int i = 0; str[i]; i++) {
+        unsigned char c = (unsigned char)str[i];
+        if (c >= 32 && c <= 126)
+            str[j++] = str[i];
+    }
+    str[j] = '\0';
+    /* Also trim trailing spaces */
+    while (j > 0 && str[j - 1] == ' ')
+        str[--j] = '\0';
+}
+
+/*
  * Convert a string to uppercase for case-insensitive comparison.
  */
 static void to_uppercase(char *str)
@@ -76,12 +94,9 @@ int game_load_words(game_state_t *game, const char *filename)
     while (fgets(line, sizeof(line), file) != NULL && 
            game->num_words < MAX_WORDS) {
         
-        /* Strip trailing newline */
+        /* Strip all trailing whitespace and control characters */
+        clean_string(line);
         size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n') {
-            line[len - 1] = '\0';
-            len--;
-        }
 
         /* Skip empty lines */
         if (len == 0)
@@ -197,6 +212,7 @@ void game_start_round(game_state_t *game)
     uint32_t word_idx = rand() % game->num_words;
     strncpy(game->secret_word, game->words[word_idx], MAX_NAME_LEN - 1);
     game->secret_word[MAX_NAME_LEN - 1] = '\0';
+    clean_string(game->secret_word);
 
     printf("Round %u started: artist is player %u, word is \"%s\"\n",
            game->round_num, game->artist_id, game->secret_word);
@@ -208,18 +224,20 @@ void game_start_round(game_state_t *game)
  */
 int game_validate_guess(game_state_t *game, const char *guess)
 {
-    char guess_upper[MAX_NAME_LEN];
-    char word_upper[MAX_NAME_LEN];
+    char guess_clean[MAX_NAME_LEN];
+    char word_clean[MAX_NAME_LEN];
 
-    strncpy(guess_upper, guess, MAX_NAME_LEN - 1);
-    guess_upper[MAX_NAME_LEN - 1] = '\0';
-    strncpy(word_upper, game->secret_word, MAX_NAME_LEN - 1);
-    word_upper[MAX_NAME_LEN - 1] = '\0';
+    strncpy(guess_clean, guess, MAX_NAME_LEN - 1);
+    guess_clean[MAX_NAME_LEN - 1] = '\0';
+    clean_string(guess_clean);
+    to_uppercase(guess_clean);
 
-    to_uppercase(guess_upper);
-    to_uppercase(word_upper);
+    strncpy(word_clean, game->secret_word, MAX_NAME_LEN - 1);
+    word_clean[MAX_NAME_LEN - 1] = '\0';
+    clean_string(word_clean);
+    to_uppercase(word_clean);
 
-    return strcmp(guess_upper, word_upper) == 0;
+    return strcmp(guess_clean, word_clean) == 0;
 }
 
 /*
