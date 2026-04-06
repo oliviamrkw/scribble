@@ -32,6 +32,7 @@ static client_info_t clients[MAX_PLAYERS];
 static int listen_fd = -1;
 static game_state_t *game = NULL;
 static time_t round_start_time = 0;
+static time_t next_round_time = 0;  /* non-zero means waiting to start next round */
 static int last_countdown = -1;
 static uint8_t canvas[CANVAS_ROWS][CANVAS_COLS];
 
@@ -165,9 +166,9 @@ static void end_round(const char *reason)
     } else {
         char next[128];
         snprintf(next, sizeof(next),
-            "\nNext round starting...\n");
+            "\nNext round starting in 1 second...\n");
         broadcast_chat(next);
-        start_round();
+        next_round_time = time(NULL) + 2;
     }
 }
 
@@ -684,6 +685,12 @@ int main(int argc, char *argv[])
                 continue;
             perror("select");
             break;
+        }
+
+        /* Check pending next-round delay */
+        if (next_round_time > 0 && time(NULL) >= next_round_time) {
+            next_round_time = 0;
+            start_round();
         }
 
         /* Check round timer */

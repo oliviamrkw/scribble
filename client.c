@@ -1,12 +1,3 @@
-/*
- * client.c — X11 GUI client for Scribble
- *
- * Usage: ./client <host> <port>
- *
- * Opens a graphical window with a drawing canvas and chat panel.
- * The artist draws with the mouse; guessers type guesses.
- * Uses select() on the X11 connection fd and the server socket.
- */
 #define _POSIX_C_SOURCE 200112L
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,26 +16,18 @@
 #include <X11/keysym.h>
 #include "net.h"
 
-/* ------------------------------------------------------------------ */
-/* Layout constants                                                    */
-/* ------------------------------------------------------------------ */
+/* Layout */
 #define CELL_SIZE    16          /* pixels per canvas cell */
 #define CANVAS_PX_W  (CANVAS_COLS * CELL_SIZE)  /* 640 */
 #define CANVAS_PX_H  (CANVAS_ROWS * CELL_SIZE)  /* 320 */
-#define CHAT_W       300        /* chat panel width */
+#define CHAT_W       300        /* chat width */
 #define TOOLBAR_H    40         /* color palette bar height */
 #define INPUT_H      28         /* text input bar height */
 #define WIN_W        (CANVAS_PX_W + CHAT_W)
 #define WIN_H        (CANVAS_PX_H + TOOLBAR_H + INPUT_H)
 #define CHAT_LINE_H  16         /* pixels per chat line */
-
-/* Chat buffer */
 #define MAX_CHAT_LINES 200
 #define MAX_LINE_LEN   256
-
-/* ------------------------------------------------------------------ */
-/* Globals                                                             */
-/* ------------------------------------------------------------------ */
 
 /* X11 */
 static Display *dpy = NULL;
@@ -53,7 +36,7 @@ static GC       gc;
 static Atom     wm_delete;
 static XFontStruct *font = NULL;
 
-/* Drawing palette — RGB values for the 8 colors */
+/* Colours */
 static unsigned long xcolors[NUM_COLORS];
 static const char *color_hex[NUM_COLORS] = {
     "#000000", "#FF0000", "#00CC00", "#DDDD00",
@@ -68,7 +51,7 @@ static int is_artist = 0;
 static int has_guessed = 0;
 static uint8_t canvas[CANVAS_ROWS][CANVAS_COLS];
 static int current_color = 1;
-static int mouse_held = 0;     /* left button held for drag-drawing */
+static int mouse_held = 0;
 
 /* Chat */
 static char chat_lines[MAX_CHAT_LINES][MAX_LINE_LEN];
@@ -78,9 +61,7 @@ static int chat_count = 0;
 static char input_buf[MAX_PAYLOAD];
 static int input_len = 0;
 
-/* ------------------------------------------------------------------ */
-/* Chat helpers                                                        */
-/* ------------------------------------------------------------------ */
+/* Chat functions */
 
 static void add_chat_line(const char *text)
 {
@@ -97,16 +78,14 @@ static void add_chat_line(const char *text)
                 memmove(chat_lines[0], chat_lines[1],
                         (MAX_CHAT_LINES - 1) * MAX_LINE_LEN);
                 snprintf(chat_lines[MAX_CHAT_LINES - 1], MAX_LINE_LEN,
-                         "%.*s", len, p);
+                        "%.*s", len, p);
             }
         }
         p = nl ? nl + 1 : p + strlen(p);
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Network helpers                                                     */
-/* ------------------------------------------------------------------ */
+/* Network functions */
 
 static int send_player_join(const char *name)
 {
@@ -154,9 +133,7 @@ static int send_draw_clear(void)
     return send_message(sockfd, &msg);
 }
 
-/* ------------------------------------------------------------------ */
-/* Handle server messages                                              */
-/* ------------------------------------------------------------------ */
+/* Server messages*/
 
 static void handle_server_message(const message_t *msg)
 {
@@ -220,9 +197,7 @@ static void handle_server_message(const message_t *msg)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Drawing the UI                                                      */
-/* ------------------------------------------------------------------ */
+/* UI */
 
 static void paint_cell(int r, int c)
 {
@@ -230,7 +205,6 @@ static void paint_cell(int r, int c)
     XFillRectangle(dpy, win, gc, c * CELL_SIZE, r * CELL_SIZE,
                    CELL_SIZE, CELL_SIZE);
 
-    /* Grid lines */
     XSetForeground(dpy, gc, xcolors[0]);
     XDrawRectangle(dpy, win, gc, c * CELL_SIZE, r * CELL_SIZE,
                    CELL_SIZE - 1, CELL_SIZE - 1);
@@ -242,7 +216,7 @@ static void redraw_all(void)
     XSetForeground(dpy, gc, WhitePixel(dpy, DefaultScreen(dpy)));
     XFillRectangle(dpy, win, gc, 0, 0, WIN_W, WIN_H);
 
-    /* ---- Canvas ---- */
+    /* Canvas */
     for (int r = 0; r < CANVAS_ROWS; r++)
         for (int c = 0; c < CANVAS_COLS; c++)
             paint_cell(r, c);
@@ -251,7 +225,7 @@ static void redraw_all(void)
     XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
     XDrawRectangle(dpy, win, gc, 0, 0, CANVAS_PX_W - 1, CANVAS_PX_H - 1);
 
-    /* ---- Toolbar (below canvas) ---- */
+    /* Toolbar */
     int ty = CANVAS_PX_H;
 
     /* Divider line */
@@ -271,12 +245,12 @@ static void redraw_all(void)
             XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
             XSetLineAttributes(dpy, gc, 3, LineSolid, CapButt, JoinMiter);
             XDrawRectangle(dpy, win, gc, sx - 2, sy - 2,
-                           swatch_size + 3, swatch_size + 3);
+                            swatch_size + 3, swatch_size + 3);
             XSetLineAttributes(dpy, gc, 1, LineSolid, CapButt, JoinMiter);
         } else {
             XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
             XDrawRectangle(dpy, win, gc, sx, sy,
-                           swatch_size - 1, swatch_size - 1);
+                            swatch_size - 1, swatch_size - 1);
         }
     }
 
@@ -296,15 +270,15 @@ static void redraw_all(void)
     if (is_artist) {
         XSetForeground(dpy, gc, 0x0000CC);
         if (font) XDrawString(dpy, win, gc, label_x, ty + 25,
-                              "DRAWER", 6);
+                                "DRAWER", 6);
     } else {
         XSetForeground(dpy, gc, 0x008800);
         const char *lbl = has_guessed ? "GUESSED!" : "GUESSER";
         if (font) XDrawString(dpy, win, gc, label_x, ty + 25,
-                              lbl, (int)strlen(lbl));
+                                lbl, (int)strlen(lbl));
     }
 
-    /* ---- Chat panel (right side) ---- */
+    /* Chat panel */
     int cx = CANVAS_PX_W;
 
     /* Vertical divider */
@@ -332,10 +306,10 @@ static void redraw_all(void)
         int len = (int)strlen(chat_lines[i]);
         if (len > maxchars) len = maxchars;
         if (font) XDrawString(dpy, win, gc, cx + 6, ty2,
-                              chat_lines[i], len);
+                                chat_lines[i], len);
     }
 
-    /* ---- Input bar (bottom) ---- */
+    /* Input bar */
     int iy = CANVAS_PX_H + TOOLBAR_H;
     XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
     XDrawLine(dpy, win, gc, 0, iy, WIN_W, iy);
@@ -353,9 +327,7 @@ static void redraw_all(void)
     XFlush(dpy);
 }
 
-/* ------------------------------------------------------------------ */
-/* Canvas mouse interaction                                            */
-/* ------------------------------------------------------------------ */
+/* Canvas mouse interaction */
 
 static void try_paint(int px, int py, uint8_t color)
 {
@@ -367,17 +339,15 @@ static void try_paint(int px, int py, uint8_t color)
     int row = py / CELL_SIZE;
     if (row >= CANVAS_ROWS || col >= CANVAS_COLS) return;
 
-    if (canvas[row][col] == color) return;  /* no change */
+    if (canvas[row][col] == color) return;
 
     canvas[row][col] = color;
     send_draw_cell((uint8_t)row, (uint8_t)col, color);
 
-    /* Immediate visual feedback — repaint just this cell */
     paint_cell(row, col);
     XFlush(dpy);
 }
 
-/* Check if a click is on a toolbar color swatch; returns color index or -1 */
 static int toolbar_hit_color(int px, int py)
 {
     int ty = CANVAS_PX_H;
@@ -394,7 +364,6 @@ static int toolbar_hit_color(int px, int py)
     return -1;
 }
 
-/* Check if a click is on the Clear button */
 static int toolbar_hit_clear(int px, int py)
 {
     int ty = CANVAS_PX_H;
@@ -406,11 +375,7 @@ static int toolbar_hit_clear(int px, int py)
             py >= clr_y && py < clr_y + swatch_size);
 }
 
-/* ------------------------------------------------------------------ */
-/* X11 event handling                                                  */
-/* ------------------------------------------------------------------ */
 
-/*
  * Returns -1 to quit, 0 otherwise.
  */
 static int handle_x11_events(void)
@@ -430,7 +395,6 @@ static int handle_x11_events(void)
             int py = ev.xbutton.y;
 
             if (ev.xbutton.button == 1) {
-                /* Check toolbar first */
                 int ci = toolbar_hit_color(px, py);
                 if (ci >= 0 && is_artist) {
                     current_color = ci;
@@ -444,11 +408,9 @@ static int handle_x11_events(void)
                     break;
                 }
 
-                /* Canvas drawing */
                 mouse_held = 1;
                 try_paint(px, py, (uint8_t)current_color);
             } else if (ev.xbutton.button == 3) {
-                /* Right click = erase */
                 try_paint(px, py, 0);
             }
             break;
@@ -460,13 +422,11 @@ static int handle_x11_events(void)
             break;
 
         case MotionNotify:
-            /* Drag drawing */
             if (mouse_held && is_artist) {
-                /* Drain extra motion events for responsiveness */
                 while (XCheckMaskEvent(dpy, PointerMotionMask, &ev))
                     ;
                 try_paint(ev.xmotion.x, ev.xmotion.y,
-                          (uint8_t)current_color);
+                            (uint8_t)current_color);
             }
             break;
 
@@ -474,7 +434,7 @@ static int handle_x11_events(void)
             char buf[32];
             KeySym ksym;
             int n = XLookupString(&ev.xkey, buf, sizeof(buf) - 1,
-                                  &ksym, NULL);
+                                    &ksym, NULL);
 
             if (ksym == XK_Return || ksym == XK_KP_Enter) {
                 if (input_len > 0) {
@@ -512,9 +472,7 @@ static int handle_x11_events(void)
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* X11 setup                                                           */
-/* ------------------------------------------------------------------ */
+/* X11 setup */
 
 static int setup_x11(void)
 {
@@ -528,23 +486,21 @@ static int setup_x11(void)
     unsigned long black = BlackPixel(dpy, screen);
     unsigned long white = WhitePixel(dpy, screen);
 
+    int pid_offset = (int)(getpid() % 6) * 30;
     win = XCreateSimpleWindow(dpy, RootWindow(dpy, screen),
-                              50, 50, WIN_W, WIN_H,
-                              1, black, white);
+                            50 + pid_offset, 50 + pid_offset, WIN_W, WIN_H,
+                            1, black, white);
 
     XStoreName(dpy, win, "Scribble");
 
-    /* Subscribe to events */
     XSelectInput(dpy, win,
-                 ExposureMask | KeyPressMask |
-                 ButtonPressMask | ButtonReleaseMask |
-                 PointerMotionMask);
+                    ExposureMask | KeyPressMask |
+                    ButtonPressMask | ButtonReleaseMask |
+                    PointerMotionMask);
 
-    /* Handle window close */
     wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wm_delete, 1);
 
-    /* Prevent resizing */
     XSizeHints *hints = XAllocSizeHints();
     if (hints) {
         hints->flags = PMinSize | PMaxSize;
