@@ -17,12 +17,40 @@ make PORT=5000
 # Start the server on a custom port
 ./server 5000
 
-# Connect a client (once implemented)
+# Start the server with verbose (DEBUG) logging
+./server -v
+./server -v 5000
+
+# Connect a client
 ./client <server_ip> <port>
+
+# Run game logic tests
+make test
 
 # Clean build artifacts
 make clean
 ```
+
+## Server Admin Console
+
+While the server is running, type commands on stdin:
+
+| Command         | Description                          |
+|-----------------|--------------------------------------|
+| `/status`       | Show uptime, players, game state     |
+| `/kick <name>`  | Kick a player by name                |
+| `/endround`     | Force-end the current round          |
+| `/quit`         | Graceful shutdown                    |
+| `/help`         | List available commands              |
+
+## Server Features
+
+- **Structured logging** — timestamped, leveled output (`[HH:MM:SS][LEVEL]`)
+- **Duplicate name rejection** — prevents two players from using the same name
+- **Idle timeout** — warns at 90 s, kicks at 120 s of inactivity (game only)
+- **Progressive hints** — reveals letters at 75 %, 50 %, and 25 % of round time
+- **Graceful shutdown** — notifies clients before closing; SIGPIPE safe
+- **Admin console** — live server management via stdin (see above)
 
 ## Project Structure
 
